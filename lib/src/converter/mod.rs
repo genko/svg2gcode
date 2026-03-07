@@ -74,11 +74,44 @@ struct ConversionVisitor<'a, T: Turtle> {
     name_stack: Vec<String>,
     /// Used to convert percentage values
     viewport_dim_stack: Vec<[f64; 2]>,
+    /// Stack of per-layer overrides pushed for every `<g>` element encountered.
+    /// Each entry records the values that *this specific group* declared (all `None` when
+    /// the group carried no relevant attributes). `visit_exit` uses this to know whether
+    /// it needs to restore an earlier override when leaving the group.
+    layer_override_stack: Vec<LayerOverride>,
     _config: &'a ConversionConfig,
     options: ConversionOptions,
 }
 
+/// Per-group layer settings read from `data-*` attributes.
+#[derive(Debug, Default, Clone, Copy)]
+struct LayerOverride {
+    /// `data-feedrate` — overrides the global feedrate (mm/min) for this layer.
+    feedrate: Option<f64>,
+    /// `data-power` — overrides the laser power (S word) for this layer.
+    power: Option<f64>,
+    /// `data-passes` — how many times every path in this layer should be repeated.
+    passes: Option<u32>,
+}
+
+impl LayerOverride {
+    fn has_any(&self) -> bool {
+        self.feedrate.is_some() || self.power.is_some() || self.passes.is_some()
+    }
+}
+
 impl<'a, T: Turtle> ConversionVisitor<'a, T> {
+    /// Returns the number of passes that should be applied to shapes in the current scope.
+    /// Walks the stack from innermost to outermost and returns the first explicit value found,
+    /// falling back to 1 if no enclosing group specified `data-passes`.
+    fn current_passes(&self) -> u32 {
+        self.layer_override_stack
+            .iter()
+            .rev()
+            .find_map(|o| o.passes)
+            .unwrap_or(1)
+    }
+
     fn comment(&mut self, node: &Node) {
         let mut comment = String::new();
         self.name_stack.iter().for_each(|name| {
@@ -119,6 +152,7 @@ pub fn svg2program<'a, 'input: 'a>(
             options: options.clone(),
             name_stack: vec![],
             viewport_dim_stack: vec![],
+            layer_override_stack: vec![],
         };
 
         visitor.begin();
@@ -155,6 +189,8 @@ pub fn svg2program<'a, 'input: 'a>(
                 machine,
                 tolerance: config.tolerance,
                 feedrate: config.feedrate,
+                layer_feedrate: None,
+                layer_power: None,
                 program: vec![],
             },
             dpi: config.dpi,
@@ -163,6 +199,7 @@ pub fn svg2program<'a, 'input: 'a>(
         options,
         name_stack: vec![],
         viewport_dim_stack: vec![],
+        layer_override_stack: vec![],
     };
 
     conversion_visitor

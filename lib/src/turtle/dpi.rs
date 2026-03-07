@@ -96,4 +96,8 @@ impl<T: Turtle> Turtle for DpiConvertingTurtle<T> {
             ctrl: self.point_to_mm(ctrl),
         })
     }
+
+    fn set_layer_overrides(&mut self, feedrate: Option<f64>, power: Option<f64>) {
+        self.inner.set_layer_overrides(feedrate, power)
+    }
 }

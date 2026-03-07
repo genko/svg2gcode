@@ -341,6 +341,152 @@ mod test {
     /// `transform-origin="5 5"` with `rotate(90)` should be identical to the
     /// manual SVG equivalent `translate(5,5) rotate(90) translate(-5,-5)`
     #[test]
+    fn layer_feedrate_override_produces_correct_feedrate() {
+        let svg = include_str!("../tests/layer_settings.svg");
+        let config = ConversionConfig::default(); // global feedrate = 300
+        let options = ConversionOptions::default();
+        let document = roxmltree::Document::parse_with_options(
+            svg,
+            ParsingOptions {
+                allow_dtd: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let machine = Machine::new(
+            SupportedFunctionality {
+                circular_interpolation: false,
+            },
+            None,
+            None,
+            None,
+            None,
+        );
+        let tokens = converter::svg2program(&document, &config, options, machine);
+
+        let mut gcode = String::new();
+        g_code::emit::format_gcode_fmt(
+            tokens.iter(),
+            g_code::emit::FormatOptions::default(),
+            &mut gcode,
+        )
+        .unwrap();
+
+        // Layer 1 overrides feedrate to 600 — all G1 moves in that layer must use F600
+        // Layer 2 overrides feedrate to 150 — all G1 moves in that layer must use F150
+        // The global feedrate (300) should never appear since both layers override it
+        assert!(
+            gcode.contains("F600"),
+            "Expected F600 from layer 1 feedrate override, got:\n{gcode}"
+        );
+        assert!(
+            gcode.contains("F150"),
+            "Expected F150 from layer 2 feedrate override, got:\n{gcode}"
+        );
+        assert!(
+            !gcode.contains("F300"),
+            "Global feedrate F300 should not appear when all layers override it, got:\n{gcode}"
+        );
+    }
+
+    #[test]
+    fn layer_power_override_emits_spindle_command() {
+        let svg = include_str!("../tests/layer_settings.svg");
+        let config = ConversionConfig::default();
+        let options = ConversionOptions::default();
+        let document = roxmltree::Document::parse_with_options(
+            svg,
+            ParsingOptions {
+                allow_dtd: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let machine = Machine::new(
+            SupportedFunctionality {
+                circular_interpolation: false,
+            },
+            None,
+            None,
+            None,
+            None,
+        );
+        let tokens = converter::svg2program(&document, &config, options, machine);
+
+        let mut gcode = String::new();
+        g_code::emit::format_gcode_fmt(
+            tokens.iter(),
+            g_code::emit::FormatOptions::default(),
+            &mut gcode,
+        )
+        .unwrap();
+
+        // Power is emitted as S inline on G1 commands (GRBL laser mode style).
+        // No M3/M5 per-path toggling — G0 automatically disables the laser in GRBL ($32=1).
+        assert!(
+            !gcode.contains("M3"),
+            "M3 should not appear per-path; power is set via S word inline on G1, got:\n{gcode}"
+        );
+        assert!(
+            gcode.contains("S80"),
+            "Expected S80 inline on G1 from layer 1 power override, got:\n{gcode}"
+        );
+        assert!(
+            gcode.contains("S255"),
+            "Expected S255 inline on G1 from layer 2 power override, got:\n{gcode}"
+        );
+    }
+
+    #[test]
+    fn layer_passes_repeats_path_correct_number_of_times() {
+        let svg = include_str!("../tests/layer_settings.svg");
+        let config = ConversionConfig::default();
+        let options = ConversionOptions::default();
+        let document = roxmltree::Document::parse_with_options(
+            svg,
+            ParsingOptions {
+                allow_dtd: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let machine = Machine::new(
+            SupportedFunctionality {
+                circular_interpolation: false,
+            },
+            None,
+            None,
+            None,
+            None,
+        );
+        let tokens = converter::svg2program(&document, &config, options, machine);
+
+        let mut gcode = String::new();
+        g_code::emit::format_gcode_fmt(
+            tokens.iter(),
+            g_code::emit::FormatOptions::default(),
+            &mut gcode,
+        )
+        .unwrap();
+
+        // Layer 1 has data-passes="2": the square path has 4 sides, so G1 at F600 should
+        // appear 4 * 2 = 8 times. Count occurrences of "F600" as a proxy for G1 moves in
+        // that layer.
+        let f600_count = gcode.matches("F600").count();
+        assert_eq!(
+            f600_count, 8,
+            "Layer 1 (2 passes × 4 sides = 8 G1 moves at F600), got {f600_count}:\n{gcode}"
+        );
+
+        // Layer 2 has data-passes="3": 4 sides × 3 = 12 G1 moves at F150.
+        let f150_count = gcode.matches("F150").count();
+        assert_eq!(
+            f150_count, 12,
+            "Layer 2 (3 passes × 4 sides = 12 G1 moves at F150), got {f150_count}:\n{gcode}"
+        );
+    }
+
+    #[test]
     fn transform_origin_matches_manual_equivalent() {
         let with_origin = get_actual(
             include_str!("../tests/transform_origin.svg"),

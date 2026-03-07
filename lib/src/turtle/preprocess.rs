@@ -38,4 +38,8 @@ impl Turtle for PreprocessTurtle {
     fn quadratic_bezier(&mut self, qbs: QuadraticBezierSegment<f64>) {
         self.bounding_box = self.bounding_box.union(&qbs.bounding_box());
     }
+
+    fn set_layer_overrides(&mut self, _feedrate: Option<f64>, _power: Option<f64>) {
+        // No-op: preprocessing only computes the bounding box
+    }
 }

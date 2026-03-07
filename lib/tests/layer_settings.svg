@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   id="svg1"
+   version="1.1"
+   viewBox="0 0 20 10"
+   height="10mm"
+   width="20mm">
+  <g
+     id="layer1"
+     inkscape:groupmode="layer"
+     inkscape:label="Layer 1 - Fast"
+     data-feedrate="600"
+     data-power="80"
+     data-passes="2">
+    <path
+       id="path1"
+       d="M 1,1 H 9 V 9 H 1 Z" />
+  </g>
+  <g
+     id="layer2"
+     inkscape:groupmode="layer"
+     inkscape:label="Layer 2 - Slow"
+     data-feedrate="150"
+     data-power="255"
+     data-passes="3">
+    <path
+       id="path2"
+       d="M 11,1 H 19 V 9 H 11 Z" />
+  </g>
+</svg>

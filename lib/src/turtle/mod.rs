@@ -23,6 +23,9 @@ pub trait Turtle: Debug {
     fn arc(&mut self, svg_arc: SvgArc<f64>);
     fn cubic_bezier(&mut self, cbs: CubicBezierSegment<f64>);
     fn quadratic_bezier(&mut self, qbs: QuadraticBezierSegment<f64>);
+    /// Override per-layer feedrate and/or laser power (S value).
+    /// Pass `None` to clear a previously set override and revert to the global setting.
+    fn set_layer_overrides(&mut self, feedrate: Option<f64>, power: Option<f64>);
 }
 
 /// Wrapper for [Turtle] that handles transforms, position, offsets, etc.  See https://www.w3.org/TR/SVG/paths.html

@@ -9,7 +9,7 @@ use svgtypes::{
 };
 
 use super::{
-    ConversionVisitor,
+    ConversionVisitor, LayerOverride,
     path::apply_path,
     transform::{get_viewport_transform, svg_transform_into_euclid_transform},
     units::DimensionHint,
@@ -274,15 +274,46 @@ impl<'a, T: Turtle> XmlVisitor for ConversionVisitor<'a, T> {
 
         self.terrarium.push_transform(flattened_transform);
 
+        // Read per-layer overrides from `data-*` attributes on `<g>` (layer) elements.
+        // Values are in the same units as the global settings:
+        //   data-feedrate : mm/min
+        //   data-power    : S word (firmware-specific, e.g. 0–1000 for GRBL)
+        //   data-passes   : positive integer, number of times each path is repeated
+        if node.tag_name().name() == GROUP_TAG_NAME {
+            let layer_override = LayerOverride {
+                feedrate: node
+                    .attribute("data-feedrate")
+                    .and_then(|v| v.parse::<f64>().ok()),
+                power: node
+                    .attribute("data-power")
+                    .and_then(|v| v.parse::<f64>().ok()),
+                passes: node
+                    .attribute("data-passes")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .map(|p| p.max(1)),
+            };
+
+            if layer_override.has_any() {
+                self.terrarium
+                    .turtle
+                    .set_layer_overrides(layer_override.feedrate, layer_override.power);
+            }
+            self.layer_override_stack.push(layer_override);
+        }
+
+        let passes = self.current_passes();
+
         match node.tag_name().name() {
             PATH_TAG_NAME => {
                 if let Some(d) = node.attribute("d") {
                     self.comment(&node);
-                    apply_path(
-                        &mut self.terrarium,
-                        PathParser::from(d)
-                            .map(|segment| segment.expect("could not parse path segment")),
-                    );
+                    for _ in 0..passes {
+                        apply_path(
+                            &mut self.terrarium,
+                            PathParser::from(d)
+                                .map(|segment| segment.expect("could not parse path segment")),
+                        );
+                    }
                 } else {
                     warn!("There is a path node containing no actual path: {node:?}");
                 }
@@ -291,23 +322,25 @@ impl<'a, T: Turtle> XmlVisitor for ConversionVisitor<'a, T> {
                 if let Some(points) = node.attribute("points") {
                     self.comment(&node);
 
-                    let mut pp = PointsParser::from(points).peekable();
-                    let path = pp
-                        .peek()
-                        .copied()
-                        .map(|(x, y)| MoveTo { abs: true, x, y })
-                        .into_iter()
-                        .chain(pp.map(|(x, y)| LineTo { abs: true, x, y }))
-                        .chain(
-                            // Path must be closed if this is a polygon
-                            if name == POLYGON_TAG_NAME {
-                                Some(ClosePath { abs: true })
-                            } else {
-                                None
-                            },
-                        );
+                    for _ in 0..passes {
+                        let mut pp = PointsParser::from(points).peekable();
+                        let path = pp
+                            .peek()
+                            .copied()
+                            .map(|(x, y)| MoveTo { abs: true, x, y })
+                            .into_iter()
+                            .chain(pp.map(|(x, y)| LineTo { abs: true, x, y }))
+                            .chain(
+                                // Path must be closed if this is a polygon
+                                if name == POLYGON_TAG_NAME {
+                                    Some(ClosePath { abs: true })
+                                } else {
+                                    None
+                                },
+                            );
 
-                    apply_path(&mut self.terrarium, path);
+                        apply_path(&mut self.terrarium, path);
+                    }
                 } else {
                     warn!("There is a {name} node containing no actual path: {node:?}");
                 }
@@ -324,75 +357,77 @@ impl<'a, T: Turtle> XmlVisitor for ConversionVisitor<'a, T> {
                 match (width, height) {
                     (Some(width), Some(height)) => {
                         self.comment(&node);
-                        apply_path(
-                            &mut self.terrarium,
-                            [
-                                MoveTo {
-                                    abs: true,
-                                    x: x + rx,
-                                    y,
-                                },
-                                HorizontalLineTo {
-                                    abs: true,
-                                    x: x + width - rx,
-                                },
-                                EllipticalArc {
-                                    abs: true,
-                                    rx,
-                                    ry,
-                                    x_axis_rotation: 0.,
-                                    large_arc: false,
-                                    sweep: true,
-                                    x: x + width,
-                                    y: y + ry,
-                                },
-                                VerticalLineTo {
-                                    abs: true,
-                                    y: y + height - ry,
-                                },
-                                EllipticalArc {
-                                    abs: true,
-                                    rx,
-                                    ry,
-                                    x_axis_rotation: 0.,
-                                    large_arc: false,
-                                    sweep: true,
-                                    x: x + width - rx,
-                                    y: y + height,
-                                },
-                                HorizontalLineTo {
-                                    abs: true,
-                                    x: x + rx,
-                                },
-                                EllipticalArc {
-                                    abs: true,
-                                    rx,
-                                    ry,
-                                    x_axis_rotation: 0.,
-                                    large_arc: false,
-                                    sweep: true,
-                                    x,
-                                    y: y + height - ry,
-                                },
-                                VerticalLineTo {
-                                    abs: true,
-                                    y: y + ry,
-                                },
-                                EllipticalArc {
-                                    abs: true,
-                                    rx,
-                                    ry,
-                                    x_axis_rotation: 0.,
-                                    large_arc: false,
-                                    sweep: true,
-                                    x: x + rx,
-                                    y,
-                                },
-                                ClosePath { abs: true },
-                            ]
-                            .into_iter()
-                            .filter(|p| has_radius || !matches!(p, EllipticalArc { .. })),
-                        )
+                        for _ in 0..passes {
+                            apply_path(
+                                &mut self.terrarium,
+                                [
+                                    MoveTo {
+                                        abs: true,
+                                        x: x + rx,
+                                        y,
+                                    },
+                                    HorizontalLineTo {
+                                        abs: true,
+                                        x: x + width - rx,
+                                    },
+                                    EllipticalArc {
+                                        abs: true,
+                                        rx,
+                                        ry,
+                                        x_axis_rotation: 0.,
+                                        large_arc: false,
+                                        sweep: true,
+                                        x: x + width,
+                                        y: y + ry,
+                                    },
+                                    VerticalLineTo {
+                                        abs: true,
+                                        y: y + height - ry,
+                                    },
+                                    EllipticalArc {
+                                        abs: true,
+                                        rx,
+                                        ry,
+                                        x_axis_rotation: 0.,
+                                        large_arc: false,
+                                        sweep: true,
+                                        x: x + width - rx,
+                                        y: y + height,
+                                    },
+                                    HorizontalLineTo {
+                                        abs: true,
+                                        x: x + rx,
+                                    },
+                                    EllipticalArc {
+                                        abs: true,
+                                        rx,
+                                        ry,
+                                        x_axis_rotation: 0.,
+                                        large_arc: false,
+                                        sweep: true,
+                                        x,
+                                        y: y + height - ry,
+                                    },
+                                    VerticalLineTo {
+                                        abs: true,
+                                        y: y + ry,
+                                    },
+                                    EllipticalArc {
+                                        abs: true,
+                                        rx,
+                                        ry,
+                                        x_axis_rotation: 0.,
+                                        large_arc: false,
+                                        sweep: true,
+                                        x: x + rx,
+                                        y,
+                                    },
+                                    ClosePath { abs: true },
+                                ]
+                                .into_iter()
+                                .filter(|p| has_radius || !matches!(p, EllipticalArc { .. })),
+                            )
+                        }
                     }
                     _other => {
                         warn!("Invalid rectangle node: {node:?}");
@@ -407,29 +442,31 @@ impl<'a, T: Turtle> XmlVisitor for ConversionVisitor<'a, T> {
                 let ry = self.length_attr_to_user_units(&node, "ry").unwrap_or(r);
                 if rx > 0. && ry > 0. {
                     self.comment(&node);
-                    apply_path(
-                        &mut self.terrarium,
-                        std::iter::once(MoveTo {
-                            abs: true,
-                            x: cx + rx,
-                            y: cy,
-                        })
-                        .chain(
-                            [(cx, cy + ry), (cx - rx, cy), (cx, cy - ry), (cx + rx, cy)].map(
-                                |(x, y)| EllipticalArc {
-                                    abs: true,
-                                    rx,
-                                    ry,
-                                    x_axis_rotation: 0.,
-                                    large_arc: false,
-                                    sweep: true,
-                                    x,
-                                    y,
-                                },
-                            ),
-                        )
-                        .chain(std::iter::once(ClosePath { abs: true })),
-                    );
+                    for _ in 0..passes {
+                        apply_path(
+                            &mut self.terrarium,
+                            std::iter::once(MoveTo {
+                                abs: true,
+                                x: cx + rx,
+                                y: cy,
+                            })
+                            .chain(
+                                [(cx, cy + ry), (cx - rx, cy), (cx, cy - ry), (cx + rx, cy)].map(
+                                    |(x, y)| EllipticalArc {
+                                        abs: true,
+                                        rx,
+                                        ry,
+                                        x_axis_rotation: 0.,
+                                        large_arc: false,
+                                        sweep: true,
+                                        x,
+                                        y,
+                                    },
+                                ),
+                            )
+                            .chain(std::iter::once(ClosePath { abs: true })),
+                        );
+                    }
                 } else {
                     warn!("Invalid {} node: {node:?}", node.tag_name().name());
                 }
@@ -442,21 +479,23 @@ impl<'a, T: Turtle> XmlVisitor for ConversionVisitor<'a, T> {
                 match (x1, y1, x2, y2) {
                     (Some(x1), Some(y1), Some(x2), Some(y2)) => {
                         self.comment(&node);
-                        apply_path(
-                            &mut self.terrarium,
-                            [
-                                MoveTo {
-                                    abs: true,
-                                    x: x1,
-                                    y: y1,
-                                },
-                                LineTo {
-                                    abs: true,
-                                    x: x2,
-                                    y: y2,
-                                },
-                            ],
-                        );
+                        for _ in 0..passes {
+                            apply_path(
+                                &mut self.terrarium,
+                                [
+                                    MoveTo {
+                                        abs: true,
+                                        x: x1,
+                                        y: y1,
+                                    },
+                                    LineTo {
+                                        abs: true,
+                                        x: x2,
+                                        y: y2,
+                                    },
+                                ],
+                            );
+                        }
                     }
                     _other => {
                         warn!("Invalid line node: {node:?}");
@@ -479,6 +518,32 @@ impl<'a, T: Turtle> XmlVisitor for ConversionVisitor<'a, T> {
         self.name_stack.pop();
         if matches!(node.tag_name().name(), SVG_TAG_NAME | SYMBOL_TAG_NAME) {
             self.viewport_dim_stack.pop();
+        }
+        // Restore the previous layer override (or clear it) when exiting a group node.
+        if node.tag_name().name() == GROUP_TAG_NAME {
+            if let Some(exiting) = self.layer_override_stack.pop() {
+                // Only need to restore feedrate/power state if this group changed them.
+                if exiting.feedrate.is_some() || exiting.power.is_some() {
+                    // Search outward for the nearest enclosing group that set feedrate/power.
+                    let previous = self
+                        .layer_override_stack
+                        .iter()
+                        .rev()
+                        .find(|e| e.feedrate.is_some() || e.power.is_some())
+                        .copied();
+                    match previous {
+                        Some(LayerOverride {
+                            feedrate, power, ..
+                        }) => {
+                            self.terrarium.turtle.set_layer_overrides(feedrate, power);
+                        }
+                        None => {
+                            // No outer override — clear back to global settings.
+                            self.terrarium.turtle.set_layer_overrides(None, None);
+                        }
+                    }
+                }
+            }
         }
     }
 }
