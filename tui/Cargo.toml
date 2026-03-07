@@ -1,0 +1,51 @@
+[package]
+name = "larris"
+version = "0.1.0"
+edition = "2024"
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Larris – laser + Ferris – a GRBL laser terminal TUI built with Rust"
+
+[[bin]]
+name = "larris"
+path = "src/main.rs"
+
+[dependencies]
+# Core svg2gcode conversion library
+svg2gcode = { path = "../lib", features = ["serde"] }
+# g-code emit/parse (used directly for format_gcode_fmt and snippet_parser)
+g-code = "0.6"
+
+# TUI
+ratatui = "0.30"
+ratatui-image = { version = "10", default-features = false, features = ["image-defaults", "crossterm"] }
+crossterm = "0.29"
+
+# Serial port
+serialport = "4"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# GCode parsing (gcode → SVG preview path reconstruction)
+gcode-nom = "0.6"
+
+# Image handling for the SVG preview rendered into ratatui-image
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# SVG rendering to a pixel buffer (used for the preview panel)
+resvg = "0.44"
+tiny-skia = "0.11"
+usvg = "0.44"
+
+# XML / SVG document parsing (shared with svg2gcode lib)
+roxmltree = "0.21"
+
+# Native file picker dialog (SVG open / GCode save)
+rfd = "0.15"
+
+# Utilities
+anyhow = "1"
+log = "0"
+env_logger = "0.11"
