@@ -1043,4 +1043,243 @@ mod tests {
         // Baseline: no S word present, result unchanged.
         assert_eq!(s.sanitised_begin_sequence(), "G90 G21 M4");
     }
+
+    // ── MachineSettings field_value / set_field round-trip ────────────────────
+
+    #[test]
+    fn field_count_matches_field_names_length() {
+        assert_eq!(
+            MachineSettings::field_count(),
+            MachineSettings::FIELD_NAMES.len()
+        );
+    }
+
+    #[test]
+    fn field_value_returns_string_for_every_index() {
+        let s = MachineSettings::default();
+        for idx in 0..MachineSettings::field_count() {
+            // Must not panic and must return a non-empty string for all valid indices
+            let v = s.field_value(idx);
+            assert!(
+                !v.is_empty() || idx == 0 || idx == 1,
+                "field_value({idx}) returned empty string unexpectedly"
+            );
+        }
+    }
+
+    #[test]
+    fn field_value_out_of_range_returns_empty() {
+        let s = MachineSettings::default();
+        assert_eq!(s.field_value(999), "");
+    }
+
+    #[test]
+    fn set_field_out_of_range_returns_error() {
+        let mut s = MachineSettings::default();
+        assert!(s.set_field(999, "42").is_err());
+    }
+
+    #[test]
+    fn set_field_roundtrip_begin_sequence() {
+        let mut s = MachineSettings::default();
+        s.set_field(0, "G90 G21 M3").unwrap();
+        assert_eq!(s.field_value(0), "G90 G21 M3");
+        assert_eq!(s.begin_sequence, "G90 G21 M3");
+    }
+
+    #[test]
+    fn set_field_roundtrip_end_sequence() {
+        let mut s = MachineSettings::default();
+        s.set_field(1, "M5 G0 X0 Y0").unwrap();
+        assert_eq!(s.field_value(1), "M5 G0 X0 Y0");
+        assert_eq!(s.end_sequence, "M5 G0 X0 Y0");
+    }
+
+    #[test]
+    fn set_field_roundtrip_max_x_mm() {
+        let mut s = MachineSettings::default();
+        s.set_field(2, "200.0").unwrap();
+        assert!((s.max_x_mm - 200.0).abs() < 1e-9);
+        assert_eq!(s.field_value(2), "200.0");
+    }
+
+    #[test]
+    fn set_field_roundtrip_max_y_mm() {
+        let mut s = MachineSettings::default();
+        s.set_field(3, "300.5").unwrap();
+        assert!((s.max_y_mm - 300.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn set_field_roundtrip_max_speed() {
+        let mut s = MachineSettings::default();
+        s.set_field(4, "5000").unwrap();
+        assert!((s.max_speed - 5000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn set_field_roundtrip_max_laser_power() {
+        let mut s = MachineSettings::default();
+        s.set_field(5, "500").unwrap();
+        assert!((s.max_laser_power - 500.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn set_field_roundtrip_feedrate() {
+        let mut s = MachineSettings::default();
+        s.set_field(6, "1500").unwrap();
+        assert!((s.feedrate - 1500.0).abs() < 1e-9);
+        assert_eq!(s.field_value(6), "1500");
+    }
+
+    #[test]
+    fn set_field_roundtrip_tolerance() {
+        let mut s = MachineSettings::default();
+        s.set_field(7, "0.0500").unwrap();
+        assert!((s.tolerance - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn set_field_roundtrip_dpi() {
+        let mut s = MachineSettings::default();
+        s.set_field(8, "72.0").unwrap();
+        assert!((s.dpi - 72.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn set_field_roundtrip_laser_power() {
+        let mut s = MachineSettings::default();
+        s.set_field(9, "750").unwrap();
+        assert!((s.laser_power - 750.0).abs() < 1e-9);
+        assert_eq!(s.field_value(9), "750");
+    }
+
+    #[test]
+    fn set_field_roundtrip_origin_x() {
+        let mut s = MachineSettings::default();
+        s.set_field(10, "12.5").unwrap();
+        assert!((s.origin_x - 12.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn set_field_roundtrip_origin_y() {
+        let mut s = MachineSettings::default();
+        s.set_field(11, "7.0").unwrap();
+        assert!((s.origin_y - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn set_field_roundtrip_circular_interpolation_true() {
+        let mut s = MachineSettings::default();
+        assert!(!s.circular_interpolation);
+        s.set_field(12, "true").unwrap();
+        assert!(s.circular_interpolation);
+        assert_eq!(s.field_value(12), "true");
+    }
+
+    #[test]
+    fn set_field_roundtrip_circular_interpolation_false() {
+        let mut s = MachineSettings::default();
+        s.circular_interpolation = true;
+        s.set_field(12, "false").unwrap();
+        assert!(!s.circular_interpolation);
+        assert_eq!(s.field_value(12), "false");
+    }
+
+    #[test]
+    fn set_field_boolean_accepts_1_and_yes() {
+        let mut s = MachineSettings::default();
+        s.set_field(13, "1").unwrap();
+        assert!(s.line_numbers);
+        s.set_field(13, "yes").unwrap();
+        assert!(s.line_numbers);
+        s.set_field(13, "no").unwrap();
+        assert!(!s.line_numbers);
+    }
+
+    #[test]
+    fn set_field_roundtrip_line_numbers() {
+        let mut s = MachineSettings::default();
+        s.set_field(13, "true").unwrap();
+        assert!(s.line_numbers);
+        assert_eq!(s.field_value(13), "true");
+    }
+
+    #[test]
+    fn set_field_roundtrip_checksums() {
+        let mut s = MachineSettings::default();
+        s.set_field(14, "true").unwrap();
+        assert!(s.checksums);
+        assert_eq!(s.field_value(14), "true");
+    }
+
+    #[test]
+    fn set_field_rejects_non_numeric_for_numeric_field() {
+        let mut s = MachineSettings::default();
+        assert!(s.set_field(2, "not_a_number").is_err());
+        assert!(s.set_field(6, "abc").is_err());
+        assert!(s.set_field(7, "???").is_err());
+    }
+
+    #[test]
+    fn set_field_trims_whitespace() {
+        let mut s = MachineSettings::default();
+        // Numeric field with surrounding whitespace should still parse
+        s.set_field(6, "  2000  ").unwrap();
+        assert!((s.feedrate - 2000.0).abs() < 1e-9);
+        // String field with surrounding whitespace is trimmed too
+        s.set_field(0, "  G90  ").unwrap();
+        assert_eq!(s.begin_sequence, "G90");
+    }
+
+    // ── ActiveTab navigation ──────────────────────────────────────────────────
+
+    #[test]
+    fn active_tab_next_wraps_around() {
+        let last = *ActiveTab::ALL.last().unwrap();
+        assert_eq!(last.next(), ActiveTab::ALL[0]);
+    }
+
+    #[test]
+    fn active_tab_prev_wraps_around() {
+        let first = ActiveTab::ALL[0];
+        assert_eq!(first.prev(), *ActiveTab::ALL.last().unwrap());
+    }
+
+    #[test]
+    fn active_tab_next_advances_sequentially() {
+        for window in ActiveTab::ALL.windows(2) {
+            assert_eq!(window[0].next(), window[1]);
+        }
+    }
+
+    #[test]
+    fn active_tab_prev_retreats_sequentially() {
+        for window in ActiveTab::ALL.windows(2) {
+            assert_eq!(window[1].prev(), window[0]);
+        }
+    }
+
+    #[test]
+    fn active_tab_all_have_non_empty_labels() {
+        for tab in ActiveTab::ALL {
+            assert!(!tab.label().is_empty(), "{tab:?} has an empty label");
+        }
+    }
+
+    // ── BaudRate ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn baud_rate_all_have_positive_u32_values() {
+        for b in BaudRate::ALL {
+            assert!(b.as_u32() > 0, "{b:?} has zero baud rate");
+        }
+    }
+
+    #[test]
+    fn baud_rate_all_have_non_empty_labels() {
+        for b in BaudRate::ALL {
+            assert!(!b.label().is_empty(), "{b:?} has empty label");
+        }
+    }
 }

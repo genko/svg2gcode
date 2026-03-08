@@ -252,41 +252,34 @@ fn serial_actor_loop(
 
                 // ── ok-gated streaming ────────────────────────────────────
                 if let Some(ref mut st) = stream {
-                    let is_ok = text.eq_ignore_ascii_case("ok");
-                    let is_error = text.to_ascii_lowercase().starts_with("error:");
-
-                    if is_ok || is_error {
-                        st.sent += 1;
-                        let total = st.lines.len();
-
-                        if is_error {
-                            // On error: report and abort the stream.
+                    match streaming_step(st, &text) {
+                        StepOutcome::NotAnAck => {
+                            // Non-ok/error lines (status reports, messages) are
+                            // already forwarded above; streaming is not affected.
+                        }
+                        StepOutcome::ErrorAbort {
+                            sent,
+                            total,
+                            reason,
+                        } => {
                             let _ = evt_tx.send(SerialEvent::StreamAborted {
-                                sent: st.sent,
+                                sent,
                                 total,
-                                reason: format!(
-                                    "GRBL reported '{}' on line {} of {}",
-                                    text, st.sent, total
-                                ),
+                                reason,
                             });
                             stream = None;
-                            continue;
                         }
-
-                        // Emit progress.
-                        let _ = evt_tx.send(SerialEvent::StreamProgress {
-                            sent: st.sent,
-                            total,
-                        });
-
-                        if st.abort || st.next_idx >= total {
-                            // All lines sent and acknowledged – done.
-                            let _ = evt_tx.send(SerialEvent::StreamDone { total: st.sent });
+                        StepOutcome::Done { total } => {
+                            let _ = evt_tx.send(SerialEvent::StreamProgress { sent: total, total });
+                            let _ = evt_tx.send(SerialEvent::StreamDone { total });
                             stream = None;
-                        } else {
-                            // Send the next line.
-                            let next = st.lines[st.next_idx].clone();
-                            st.next_idx += 1;
+                        }
+                        StepOutcome::SendNext(next) => {
+                            let total = st.lines.len();
+                            let _ = evt_tx.send(SerialEvent::StreamProgress {
+                                sent: st.sent,
+                                total,
+                            });
                             if write_tx.send(Some(next)).is_err() {
                                 let _ = evt_tx.send(SerialEvent::StreamAborted {
                                     sent: st.sent,
@@ -297,8 +290,6 @@ fn serial_actor_loop(
                             }
                         }
                     }
-                    // Non-ok/error lines (status reports, messages) are
-                    // already forwarded above; streaming is not affected.
                 }
             }
             Err(ref e)
@@ -319,7 +310,7 @@ fn serial_actor_loop(
 }
 
 /// State kept while streaming GCode line by line.
-struct StreamState {
+pub(crate) struct StreamState {
     /// All lines to be sent.
     lines: Vec<String>,
     /// Index of the next line to send (after the current ack).
@@ -328,6 +319,61 @@ struct StreamState {
     sent: usize,
     /// When true, stop after the current in-flight line is acked.
     abort: bool,
+}
+
+/// The outcome of processing one inbound GRBL acknowledgement line while
+/// streaming.  Returned by [`streaming_step`] so the logic can be tested
+/// without a real serial port.
+#[derive(Debug, PartialEq)]
+pub(crate) enum StepOutcome {
+    /// Send the next GCode line (payload) and continue streaming.
+    SendNext(String),
+    /// All lines have been acknowledged — streaming is complete.
+    Done { total: usize },
+    /// An `error:N` response was received — streaming must be aborted.
+    ErrorAbort {
+        sent: usize,
+        total: usize,
+        reason: String,
+    },
+    /// The inbound line was not an ok/error acknowledgement; streaming
+    /// continues unaffected (e.g. a status report `<Idle|…>`).
+    NotAnAck,
+}
+
+/// Pure streaming step: given the current [`StreamState`] and an inbound line
+/// from GRBL, decide what to do next.
+///
+/// The caller is responsible for actually sending the next line and for
+/// emitting the appropriate [`SerialEvent`]s.  This separation makes the
+/// ok-gated protocol logic unit-testable without a real serial port.
+pub(crate) fn streaming_step(st: &mut StreamState, line: &str) -> StepOutcome {
+    let is_ok = line.eq_ignore_ascii_case("ok");
+    let is_error = line.to_ascii_lowercase().starts_with("error:");
+
+    if !is_ok && !is_error {
+        return StepOutcome::NotAnAck;
+    }
+
+    st.sent += 1;
+    let total = st.lines.len();
+
+    if is_error {
+        return StepOutcome::ErrorAbort {
+            sent: st.sent,
+            total,
+            reason: format!("GRBL reported '{}' on line {} of {}", line, st.sent, total),
+        };
+    }
+
+    // It was an "ok".
+    if st.abort || st.next_idx >= total {
+        StepOutcome::Done { total: st.sent }
+    } else {
+        let next = st.lines[st.next_idx].clone();
+        st.next_idx += 1;
+        StepOutcome::SendNext(next)
+    }
 }
 
 /// Blocking loop that writes lines to the serial port.
@@ -389,5 +435,178 @@ mod tests {
     #[test]
     fn validate_rejects_missing_device() {
         assert!(validate_port_path("/dev/ttyUSB_does_not_exist_xyz").is_err());
+    }
+
+    // ── streaming_step ────────────────────────────────────────────────────────
+
+    fn make_stream(lines: &[&str]) -> StreamState {
+        StreamState {
+            lines: lines.iter().map(|s| s.to_string()).collect(),
+            next_idx: 1, // first line already in-flight
+            sent: 0,
+            abort: false,
+        }
+    }
+
+    #[test]
+    fn step_non_ack_line_is_ignored() {
+        let mut st = make_stream(&["G0 X0", "G1 X10 S500"]);
+        let outcome = streaming_step(&mut st, "<Idle|MPos:0,0,0|FS:0,0>");
+        assert_eq!(outcome, StepOutcome::NotAnAck);
+        // State must be unchanged
+        assert_eq!(st.sent, 0);
+        assert_eq!(st.next_idx, 1);
+    }
+
+    #[test]
+    fn step_ok_on_single_line_stream_completes() {
+        // Only one line — first ok means Done
+        let mut st = make_stream(&["G0 X0"]);
+        // next_idx starts at 1 which equals lines.len(), so Done immediately
+        let outcome = streaming_step(&mut st, "ok");
+        assert_eq!(outcome, StepOutcome::Done { total: 1 });
+        assert_eq!(st.sent, 1);
+    }
+
+    #[test]
+    fn step_ok_advances_to_next_line() {
+        let mut st = make_stream(&["G0 X0", "G1 X10 S500", "G0 X0"]);
+        // First ok → send line index 1
+        let outcome = streaming_step(&mut st, "ok");
+        assert_eq!(outcome, StepOutcome::SendNext("G1 X10 S500".to_string()));
+        assert_eq!(st.sent, 1);
+        assert_eq!(st.next_idx, 2);
+    }
+
+    #[test]
+    fn step_ok_case_insensitive() {
+        let mut st = make_stream(&["G0 X0"]);
+        // GRBL sometimes sends "OK" in uppercase
+        let outcome = streaming_step(&mut st, "OK");
+        assert_eq!(outcome, StepOutcome::Done { total: 1 });
+    }
+
+    #[test]
+    fn step_full_sequence_all_oks() {
+        // Simulate a 3-line stream with all oks
+        let lines = &["G0 X0", "G1 X10 S500", "G0 X0"];
+        let mut st = make_stream(lines);
+
+        // ok 1 → SendNext line[1]
+        match streaming_step(&mut st, "ok") {
+            StepOutcome::SendNext(l) => assert_eq!(l, "G1 X10 S500"),
+            other => panic!("expected SendNext, got {other:?}"),
+        }
+
+        // ok 2 → SendNext line[2]
+        match streaming_step(&mut st, "ok") {
+            StepOutcome::SendNext(l) => assert_eq!(l, "G0 X0"),
+            other => panic!("expected SendNext, got {other:?}"),
+        }
+
+        // ok 3 → Done
+        match streaming_step(&mut st, "ok") {
+            StepOutcome::Done { total } => assert_eq!(total, 3),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_error_response_aborts_immediately() {
+        let mut st = make_stream(&["G0 X0", "G1 X10 S500", "G0 X0"]);
+        let outcome = streaming_step(&mut st, "error:22");
+        match outcome {
+            StepOutcome::ErrorAbort {
+                sent,
+                total,
+                reason,
+            } => {
+                assert_eq!(sent, 1);
+                assert_eq!(total, 3);
+                assert!(reason.contains("error:22"), "reason: {reason}");
+            }
+            other => panic!("expected ErrorAbort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_error_is_case_insensitive() {
+        let mut st = make_stream(&["G0 X0"]);
+        let outcome = streaming_step(&mut st, "ERROR:5");
+        assert!(
+            matches!(outcome, StepOutcome::ErrorAbort { .. }),
+            "expected ErrorAbort for uppercase ERROR:5, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn step_error_on_last_line_still_aborts() {
+        // Even if it's the last line, an error response must abort, not Done.
+        let mut st = make_stream(&["G0 X0"]);
+        // Manually advance so this is the last ack
+        let outcome = streaming_step(&mut st, "error:1");
+        assert!(
+            matches!(outcome, StepOutcome::ErrorAbort { .. }),
+            "expected ErrorAbort on last line error, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn step_abort_flag_causes_done_on_next_ok() {
+        let mut st = make_stream(&["G0 X0", "G1 X10 S500", "G0 X0"]);
+        st.abort = true;
+        // Even though there are more lines, abort=true means Done after next ok
+        let outcome = streaming_step(&mut st, "ok");
+        assert!(
+            matches!(outcome, StepOutcome::Done { .. }),
+            "expected Done when abort=true, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn step_sent_counter_increments_on_each_ack() {
+        let lines = &["A", "B", "C", "D"];
+        let mut st = make_stream(lines);
+        streaming_step(&mut st, "ok"); // sent=1
+        streaming_step(&mut st, "ok"); // sent=2
+        assert_eq!(st.sent, 2);
+    }
+
+    #[test]
+    fn step_next_idx_increments_correctly() {
+        let lines = &["A", "B", "C", "D"];
+        let mut st = make_stream(lines);
+        assert_eq!(st.next_idx, 1);
+        streaming_step(&mut st, "ok"); // sends B, next_idx→2
+        assert_eq!(st.next_idx, 2);
+        streaming_step(&mut st, "ok"); // sends C, next_idx→3
+        assert_eq!(st.next_idx, 3);
+    }
+
+    #[test]
+    fn step_empty_line_is_not_an_ack() {
+        let mut st = make_stream(&["G0 X0"]);
+        let outcome = streaming_step(&mut st, "");
+        assert_eq!(outcome, StepOutcome::NotAnAck);
+    }
+
+    #[test]
+    fn step_status_line_between_oks_does_not_affect_state() {
+        // GRBL may interleave status reports between ok responses
+        let lines = &["G0 X0", "G1 X10 S500"];
+        let mut st = make_stream(lines);
+
+        // Status report — not an ack
+        assert_eq!(
+            streaming_step(&mut st, "<Idle|MPos:0,0,0|FS:0,0>"),
+            StepOutcome::NotAnAck
+        );
+        assert_eq!(st.sent, 0);
+
+        // Real ok follows
+        match streaming_step(&mut st, "ok") {
+            StepOutcome::SendNext(l) => assert_eq!(l, "G1 X10 S500"),
+            other => panic!("expected SendNext after status, got {other:?}"),
+        }
     }
 }

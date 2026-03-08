@@ -424,6 +424,139 @@ mod laser_bb {
         None
     }
 
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // ── laser_bounding_box ─────────────────────────────────────────────
+
+        #[test]
+        fn bb_empty_gcode_returns_none() {
+            assert!(laser_bounding_box("").is_none());
+        }
+
+        #[test]
+        fn bb_only_rapid_moves_returns_none() {
+            // G0 moves with no laser-on S word should never contribute
+            let gcode = "G90\nG0 X10 Y10\nG0 X20 Y20\n";
+            assert!(laser_bounding_box(gcode).is_none());
+        }
+
+        #[test]
+        fn bb_simple_laser_on_g1() {
+            // A single G1 move with S > 0 should produce a bounding box
+            let gcode = "G90\nG1 X10 Y5 S500\n";
+            let result = laser_bounding_box(gcode);
+            assert!(result.is_some(), "expected Some bounding box");
+            let ((x0, y0), (x1, y1)) = result.unwrap();
+            assert!((x0 - 0.0).abs() < 1e-9, "min x should be 0 (origin)");
+            assert!((y0 - 0.0).abs() < 1e-9, "min y should be 0 (origin)");
+            assert!((x1 - 10.0).abs() < 1e-9, "max x should be 10");
+            assert!((y1 - 5.0).abs() < 1e-9, "max y should be 5");
+        }
+
+        #[test]
+        fn bb_s_word_is_sticky() {
+            // S set on one line stays in effect for subsequent G1 moves
+            let gcode = "G90\nG1 X10 Y0 S800\nG1 X10 Y20\n";
+            let result = laser_bounding_box(gcode);
+            assert!(result.is_some());
+            let ((_, y0), (_, y1)) = result.unwrap();
+            assert!((y0 - 0.0).abs() < 1e-9);
+            assert!(
+                (y1 - 20.0).abs() < 1e-9,
+                "sticky S should make second G1 contribute"
+            );
+        }
+
+        #[test]
+        fn bb_s0_turns_laser_off() {
+            // After S0 the move should not contribute to the bounding box
+            let gcode = "G90\nG1 X10 Y0 S800\nG1 X10 Y30 S0\n";
+            let result = laser_bounding_box(gcode);
+            assert!(result.is_some());
+            let ((_, _), (_, y1)) = result.unwrap();
+            // The S0 move ends at Y30 but must not expand the box beyond Y0
+            assert!(
+                y1 < 1.0,
+                "S0 move to Y30 must not expand the bounding box, got y1={y1}"
+            );
+        }
+
+        #[test]
+        fn bb_g0_never_contributes() {
+            // G0 moves are always rapid (laser off) regardless of prior S value
+            let gcode = "G90\nG1 X5 Y5 S500\nG0 X100 Y100\n";
+            let result = laser_bounding_box(gcode);
+            assert!(result.is_some());
+            let ((_, _), (x1, y1)) = result.unwrap();
+            assert!(
+                x1 <= 5.0 + 1e-9,
+                "G0 to X100 must not expand bounding box, got x1={x1}"
+            );
+            assert!(
+                y1 <= 5.0 + 1e-9,
+                "G0 to Y100 must not expand bounding box, got y1={y1}"
+            );
+        }
+
+        #[test]
+        fn bb_relative_mode_accumulates_correctly() {
+            // G91 relative positioning: moves are relative to current position
+            let gcode = "G91\nG1 X10 Y0 S600\nG1 X0 Y10\n";
+            let result = laser_bounding_box(gcode);
+            assert!(result.is_some());
+            let ((x0, y0), (x1, y1)) = result.unwrap();
+            assert!((x0 - 0.0).abs() < 1e-9, "origin x=0");
+            assert!((y0 - 0.0).abs() < 1e-9, "origin y=0");
+            assert!((x1 - 10.0).abs() < 1e-9, "relative X+10 from 0 = 10");
+            assert!((y1 - 10.0).abs() < 1e-9, "relative Y+10 from 0 = 10");
+        }
+
+        #[test]
+        fn bb_s_word_on_non_motion_line_is_picked_up() {
+            // S word on an M4 line (before any G1) should set the sticky S value
+            let gcode = "G90\nM4 S1000\nG1 X20 Y20\n";
+            let result = laser_bounding_box(gcode);
+            assert!(
+                result.is_some(),
+                "S word on M4 line should set sticky S so subsequent G1 contributes"
+            );
+        }
+
+        #[test]
+        fn bb_multiline_expands_correctly() {
+            // Several laser-on segments; bounding box must cover all of them
+            let gcode = "G90\nG1 X10 Y0 S500\nG1 X10 Y15\nG1 X-5 Y15\n";
+            let result = laser_bounding_box(gcode);
+            assert!(result.is_some());
+            let ((x0, _), (x1, y1)) = result.unwrap();
+            assert!((x0 - -5.0).abs() < 1e-9, "min x should be -5");
+            assert!((x1 - 10.0).abs() < 1e-9, "max x should be 10");
+            assert!((y1 - 15.0).abs() < 1e-9, "max y should be 15");
+        }
+
+        #[test]
+        fn bb_g90_restores_absolute_mode() {
+            // Switch to relative then back to absolute; positions must be resolved correctly
+            let gcode = "G90\nG1 X5 Y5 S500\nG91\nG1 X5 Y5\nG90\nG1 X0 Y0\n";
+            let result = laser_bounding_box(gcode);
+            assert!(result.is_some());
+            let ((x0, y0), (x1, y1)) = result.unwrap();
+            // After G91 X5 Y5 from (5,5) we are at (10,10). G90 X0 Y0 → (0,0)
+            assert!(
+                (x0 - 0.0).abs() < 1e-9,
+                "x0 should be 0 after absolute G1 X0"
+            );
+            assert!(
+                (y0 - 0.0).abs() < 1e-9,
+                "y0 should be 0 after absolute G1 Y0"
+            );
+            assert!((x1 - 10.0).abs() < 1e-9, "x1 should be 10");
+            assert!((y1 - 10.0).abs() < 1e-9, "y1 should be 10");
+        }
+    }
+
     /// Resolve next X/Y position from params (mirrors the private `resolve_xy`).
     fn resolve_xy_bb(
         params: &std::collections::HashSet<PosVal>,
@@ -768,6 +901,211 @@ pub fn gcode_to_image(gcode: &str, max_w: u32, max_h: u32) -> Result<RgbaImage> 
 }
 
 // ── Bresenham line drawing ────────────────────────────────────────────────────
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    fn valid_settings() -> MachineSettings {
+        MachineSettings::default()
+    }
+
+    // ── validate_settings ─────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_settings_accepts_defaults() {
+        assert!(validate_settings(&valid_settings()).is_ok());
+    }
+
+    #[test]
+    fn validate_settings_rejects_zero_feedrate() {
+        let mut s = valid_settings();
+        s.feedrate = 0.0;
+        let err = validate_settings(&s).unwrap_err();
+        assert!(err.body.contains("Feedrate"), "body: {}", err.body);
+    }
+
+    #[test]
+    fn validate_settings_rejects_negative_feedrate() {
+        let mut s = valid_settings();
+        s.feedrate = -100.0;
+        let err = validate_settings(&s).unwrap_err();
+        assert!(err.body.contains("Feedrate"), "body: {}", err.body);
+    }
+
+    #[test]
+    fn validate_settings_rejects_feedrate_above_max_speed() {
+        let mut s = valid_settings();
+        s.max_speed = 1000.0;
+        s.feedrate = 2000.0;
+        let err = validate_settings(&s).unwrap_err();
+        assert!(
+            err.body.contains("max speed"),
+            "expected max speed message, got: {}",
+            err.body
+        );
+    }
+
+    #[test]
+    fn validate_settings_rejects_zero_tolerance() {
+        let mut s = valid_settings();
+        s.tolerance = 0.0;
+        let err = validate_settings(&s).unwrap_err();
+        assert!(err.body.contains("Tolerance"), "body: {}", err.body);
+    }
+
+    #[test]
+    fn validate_settings_rejects_negative_tolerance() {
+        let mut s = valid_settings();
+        s.tolerance = -0.01;
+        let err = validate_settings(&s).unwrap_err();
+        assert!(err.body.contains("Tolerance"), "body: {}", err.body);
+    }
+
+    #[test]
+    fn validate_settings_rejects_zero_dpi() {
+        let mut s = valid_settings();
+        s.dpi = 0.0;
+        let err = validate_settings(&s).unwrap_err();
+        assert!(err.body.contains("DPI"), "body: {}", err.body);
+    }
+
+    #[test]
+    fn validate_settings_rejects_negative_laser_power() {
+        let mut s = valid_settings();
+        s.laser_power = -1.0;
+        let err = validate_settings(&s).unwrap_err();
+        assert!(err.body.contains("Laser power"), "body: {}", err.body);
+    }
+
+    #[test]
+    fn validate_settings_rejects_laser_power_above_max() {
+        let mut s = valid_settings();
+        s.max_laser_power = 500.0;
+        s.laser_power = 600.0;
+        let err = validate_settings(&s).unwrap_err();
+        assert!(err.body.contains("Laser power"), "body: {}", err.body);
+    }
+
+    #[test]
+    fn validate_settings_rejects_zero_work_area() {
+        let mut s = valid_settings();
+        s.max_x_mm = 0.0;
+        let err = validate_settings(&s).unwrap_err();
+        assert!(err.body.contains("Work area"), "body: {}", err.body);
+    }
+
+    #[test]
+    fn validate_settings_rejects_negative_origin() {
+        let mut s = valid_settings();
+        s.origin_x = -1.0;
+        let err = validate_settings(&s).unwrap_err();
+        assert!(err.body.contains("Origin"), "body: {}", err.body);
+    }
+
+    #[test]
+    fn validate_settings_accumulates_multiple_errors() {
+        let mut s = valid_settings();
+        s.feedrate = 0.0;
+        s.tolerance = 0.0;
+        s.dpi = 0.0;
+        let err = validate_settings(&s).unwrap_err();
+        // All three problems should appear in the body
+        assert!(err.body.contains("Feedrate"), "body: {}", err.body);
+        assert!(err.body.contains("Tolerance"), "body: {}", err.body);
+        assert!(err.body.contains("DPI"), "body: {}", err.body);
+    }
+
+    // ── validate_extents ──────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_extents_accepts_job_inside_work_area() {
+        let s = valid_settings(); // max 150 × 150 mm
+        assert!(validate_extents(&s, (0.0, 0.0), (100.0, 100.0)).is_ok());
+    }
+
+    #[test]
+    fn validate_extents_accepts_job_exactly_at_limit() {
+        let s = valid_settings();
+        assert!(validate_extents(&s, (0.0, 0.0), (150.0, 150.0)).is_ok());
+    }
+
+    #[test]
+    fn validate_extents_rejects_x_overrun() {
+        let s = valid_settings();
+        let err = validate_extents(&s, (0.0, 0.0), (160.0, 100.0)).unwrap_err();
+        assert_eq!(err.title, "Job exceeds work area");
+        assert!(
+            err.body.contains("machine limit"),
+            "expected machine limit message, got: {}",
+            err.body
+        );
+    }
+
+    #[test]
+    fn validate_extents_rejects_y_overrun() {
+        let s = valid_settings();
+        let err = validate_extents(&s, (0.0, 0.0), (100.0, 200.0)).unwrap_err();
+        assert_eq!(err.title, "Job exceeds work area");
+        assert!(err.body.contains("machine limit"), "body: {}", err.body);
+    }
+
+    #[test]
+    fn validate_extents_rejects_negative_x_min() {
+        let s = valid_settings();
+        let err = validate_extents(&s, (-5.0, 0.0), (50.0, 50.0)).unwrap_err();
+        assert!(
+            err.body.contains("must be ≥ 0"),
+            "expected negative-X message, got: {}",
+            err.body
+        );
+    }
+
+    #[test]
+    fn validate_extents_rejects_negative_y_min() {
+        let s = valid_settings();
+        let err = validate_extents(&s, (0.0, -3.0), (50.0, 50.0)).unwrap_err();
+        assert!(
+            err.body.contains("must be ≥ 0"),
+            "expected negative-Y message, got: {}",
+            err.body
+        );
+    }
+
+    #[test]
+    fn validate_extents_reports_both_axis_overruns() {
+        let s = valid_settings();
+        let err = validate_extents(&s, (0.0, 0.0), (200.0, 200.0)).unwrap_err();
+        // Body must mention both X and Y overruns
+        let x_mention = err.body.contains("X 200");
+        let y_mention = err.body.contains("Y 200");
+        assert!(
+            x_mention && y_mention,
+            "expected both X and Y overrun messages, got: {}",
+            err.body
+        );
+    }
+
+    #[test]
+    fn validate_extents_body_contains_job_size_summary() {
+        let s = valid_settings();
+        let err = validate_extents(&s, (0.0, 0.0), (200.0, 175.0)).unwrap_err();
+        assert!(
+            err.body.contains("Job size"),
+            "expected job size summary, got: {}",
+            err.body
+        );
+        assert!(
+            err.body.contains("Work area"),
+            "expected work area summary, got: {}",
+            err.body
+        );
+    }
+}
 
 fn put_pixel_safe(img: &mut RgbaImage, x: i64, y: i64, colour: Rgba<u8>) {
     if x >= 0 && y >= 0 && (x as u32) < img.width() && (y as u32) < img.height() {
