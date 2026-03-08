@@ -1,5 +1,7 @@
 use std::str::FromStr;
 
+use super::svg_layer_key;
+
 use euclid::default::Transform2D;
 use log::{debug, warn};
 use roxmltree::{Document, Node};
@@ -279,18 +281,35 @@ impl<'a, T: Turtle> XmlVisitor for ConversionVisitor<'a, T> {
         //   data-feedrate : mm/min
         //   data-power    : S word (firmware-specific, e.g. 0–1000 for GRBL)
         //   data-passes   : positive integer, number of times each path is repeated
+        //
+        // UI-supplied overrides (in `self.options.layer_overrides`) take precedence over
+        // values baked into the SVG's `data-*` attributes.
         if node.tag_name().name() == GROUP_TAG_NAME {
+            let key = svg_layer_key(node.attribute("id"), self.group_counter);
+            self.group_counter += 1;
+
+            // Values from SVG data-* attributes (lowest priority)
+            let svg_feedrate = node
+                .attribute("data-feedrate")
+                .and_then(|v| v.parse::<f64>().ok());
+            let svg_power = node
+                .attribute("data-power")
+                .and_then(|v| v.parse::<f64>().ok());
+            let svg_passes = node
+                .attribute("data-passes")
+                .and_then(|v| v.parse::<u32>().ok())
+                .map(|p| p.max(1));
+
+            // UI override (higher priority) — merge on top of SVG values
+            let ui = self.options.layer_overrides.get(&key);
+            let feedrate = ui.and_then(|o| o.feedrate).or(svg_feedrate);
+            let power = ui.and_then(|o| o.power).or(svg_power);
+            let passes = ui.and_then(|o| o.passes).map(|p| p.max(1)).or(svg_passes);
+
             let layer_override = LayerOverride {
-                feedrate: node
-                    .attribute("data-feedrate")
-                    .and_then(|v| v.parse::<f64>().ok()),
-                power: node
-                    .attribute("data-power")
-                    .and_then(|v| v.parse::<f64>().ok()),
-                passes: node
-                    .attribute("data-passes")
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .map(|p| p.max(1)),
+                feedrate,
+                power,
+                passes,
             };
 
             if layer_override.has_any() {

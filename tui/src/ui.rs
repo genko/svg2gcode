@@ -23,11 +23,11 @@
 //!  └──────────────────┴──────────────────────────────────┘
 //!
 //! GCode tab:
-//!  ┌─────────────────────────────────────────────────────┐
-//!  │ SVG path + conversion controls                      │
-//!  ├─────────────────────────────────────────────────────┤
-//!  │ GCode text (scrollable)                             │
-//!  └─────────────────────────────────────────────────────┘
+//!  ┌──────────────────────────────────────┬──────────────┐
+//!  │ SVG path + conversion controls       │ Layers       │
+//!  ├──────────────────────────────────────┤ (panel)      │
+//!  │ GCode text (scrollable)              │              │
+//!  └──────────────────────────────────────┴──────────────┘
 //!
 //! Preview tab:
 //!  ┌───────────────────────┬─────────────────────────────┐
@@ -46,8 +46,8 @@ use ratatui::{
 };
 
 use crate::app::{
-    ActiveTab, App, AppMode, ConversionErrorPopup, ConversionStatus, FocusedPane, LineKind,
-    MachineSettings,
+    ActiveTab, App, AppMode, ConversionErrorPopup, ConversionStatus, FocusedPane, GCodeFocus,
+    LineKind, MachineSettings,
 };
 
 // ── Palette ───────────────────────────────────────────────────────────────────
@@ -525,14 +525,31 @@ fn render_baud_dropdown(app: &App, frame: &mut Frame, screen: Rect) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn render_gcode_tab(app: &App, frame: &mut Frame, area: Rect) {
-    // Top control bar (4 lines) + gcode text body
-    let v = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(0)])
-        .split(area);
+    // If there are layers, split horizontally: left = gcode, right = layer panel
+    if app.layers.is_empty() {
+        // No layers: full-width layout
+        let v = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(4), Constraint::Min(0)])
+            .split(area);
+        render_gcode_controls(app, frame, v[0]);
+        render_gcode_text(app, frame, v[1]);
+    } else {
+        // With layers: left column (gcode) + right column (layer panel)
+        let h = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(36)])
+            .split(area);
 
-    render_gcode_controls(app, frame, v[0]);
-    render_gcode_text(app, frame, v[1]);
+        let v = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(4), Constraint::Min(0)])
+            .split(h[0]);
+
+        render_gcode_controls(app, frame, v[0]);
+        render_gcode_text(app, frame, v[1]);
+        render_layer_panel(app, frame, h[1]);
+    }
 }
 
 fn render_gcode_controls(app: &App, frame: &mut Frame, area: Rect) {
@@ -622,7 +639,7 @@ fn render_gcode_controls(app: &App, frame: &mut Frame, area: Rect) {
             ])
         } else {
             Line::from(vec![Span::styled(
-                "  o:open SVG   c:convert   s:save   g:send   f:frame job   ↑↓/PgUp/Dn:scroll",
+                "  o:open SVG   c:convert   s:save   g:send   f:frame job   l:layers   ↑↓/PgUp/Dn:scroll",
                 Style::default().fg(C_INFO),
             )])
         },
@@ -713,6 +730,237 @@ fn render_gcode_text(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 /// Syntax-colour a single GCode line.
+// ── Layer panel ───────────────────────────────────────────────────────────────
+
+fn render_layer_panel(app: &App, frame: &mut Frame, area: Rect) {
+    let focused = app.gcode_focus == GCodeFocus::Layers;
+    let border_style = Style::default().fg(if focused {
+        C_BORDER_ACT
+    } else {
+        C_BORDER_INACT
+    });
+
+    let title = if focused {
+        Span::styled(
+            " Layers [active] ",
+            Style::default().fg(C_HL).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            " Layers ",
+            Style::default().fg(C_TITLE).add_modifier(Modifier::BOLD),
+        )
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .title(title);
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.layers.is_empty() {
+        let msg = Paragraph::new(Span::styled(
+            "No layers detected.",
+            Style::default().fg(C_INFO),
+        ));
+        frame.render_widget(msg, inner);
+        return;
+    }
+
+    // Hint line at the bottom (1 line)
+    let hint_area = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: 1,
+        ..inner
+    };
+    let body_area = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+
+    let hint = if focused {
+        if app.layer_edit_field.is_some() {
+            "Enter:confirm  Esc:cancel"
+        } else {
+            "f:speed  p:pwr  n:passes  r:reset  Esc:back"
+        }
+    } else {
+        "l:focus layers"
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(C_INFO))),
+        hint_area,
+    );
+
+    // One row per layer; each row is 4 lines tall (label + 3 fields)
+    let row_h: u16 = 4;
+    let visible = (body_area.height / row_h) as usize;
+    let total = app.layers.len();
+
+    // Keep the selected layer visible by computing a scroll offset
+    let scroll_offset = if total <= visible {
+        0
+    } else {
+        app.layer_selected.saturating_sub(visible.saturating_sub(1))
+    };
+
+    let global_feedrate = app.machine_settings.feedrate;
+    let global_power = app.machine_settings.laser_power;
+
+    for (slot, layer_idx) in (scroll_offset..(scroll_offset + visible).min(total)).enumerate() {
+        let layer = &app.layers[layer_idx];
+        let selected = layer_idx == app.layer_selected && focused;
+
+        let row_rect = Rect {
+            x: body_area.x,
+            y: body_area.y + (slot as u16) * row_h,
+            width: body_area.width,
+            height: row_h,
+        };
+        if row_rect.y + row_h > body_area.y + body_area.height {
+            break;
+        }
+
+        // Row background highlight for selected layer
+        let row_style = if selected {
+            Style::default().bg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(Block::default().style(row_style), row_rect);
+
+        // Layer label (truncated to fit width)
+        let label_area = Rect {
+            height: 1,
+            ..row_rect
+        };
+        let label_prefix = if selected { "▶ " } else { "  " };
+        let max_label = row_rect.width.saturating_sub(2) as usize;
+        let label_text = format!(
+            "{}{:.width$}",
+            label_prefix,
+            layer.label,
+            width = max_label.saturating_sub(2)
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                label_text,
+                Style::default()
+                    .fg(if selected { C_HL } else { C_TITLE })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            )),
+            label_area,
+        );
+
+        // Three field rows: Speed, Power, Passes
+        let field_names = ["Spd", "Pwr", "×  "];
+        let field_edit_idx = [0, 1, 2];
+        let field_values: [String; 3] = [
+            {
+                let v = layer.feedrate.or(layer.svg_feedrate);
+                match v {
+                    Some(f) => format!("{f:.0}"),
+                    None => format!("({global_feedrate:.0})"),
+                }
+            },
+            {
+                let v = layer.power.or(layer.svg_power);
+                match v {
+                    Some(p) => format!("{p:.0}"),
+                    None => format!("({global_power:.0})"),
+                }
+            },
+            {
+                let v = layer.passes.or(layer.svg_passes);
+                match v {
+                    Some(p) => p.to_string(),
+                    None => "(1)".to_owned(),
+                }
+            },
+        ];
+        // Whether this value is a user override (not falling back)
+        let is_override: [bool; 3] = [
+            layer.feedrate.is_some(),
+            layer.power.is_some(),
+            layer.passes.is_some(),
+        ];
+
+        for fi in 0..3usize {
+            let field_area = Rect {
+                y: row_rect.y + 1 + fi as u16,
+                height: 1,
+                ..row_rect
+            };
+
+            let editing = selected && app.layer_edit_field == Some(field_edit_idx[fi]);
+
+            let (label_fg, value_fg) = if editing {
+                (C_WARN, C_WARN)
+            } else if is_override[fi] {
+                (C_INFO, C_OK)
+            } else {
+                (C_INFO, C_INFO)
+            };
+
+            let display_value = if editing {
+                let cursor = if (frame.count() / 4) % 2 == 0 {
+                    "█"
+                } else {
+                    " "
+                };
+                format!("{}{}", app.layer_edit_buf, cursor)
+            } else {
+                field_values[fi].clone()
+            };
+
+            let error_suffix = if editing {
+                app.layer_edit_error
+                    .as_deref()
+                    .map(|e| format!(" ✗{e}"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("  {}:", field_names[fi]),
+                    Style::default().fg(label_fg),
+                ),
+                Span::styled(
+                    format!(" {}{}", display_value, error_suffix),
+                    Style::default().fg(value_fg),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), field_area);
+        }
+    }
+
+    // Scrollbar if needed
+    if total > visible && visible > 0 {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"));
+        let max_pos = total.saturating_sub(visible);
+        let mut state = ScrollbarState::new(max_pos + 1).position(scroll_offset.min(max_pos));
+        frame.render_stateful_widget(
+            scrollbar,
+            body_area.inner(Margin {
+                vertical: 0,
+                horizontal: 0,
+            }),
+            &mut state,
+        );
+    }
+}
+
 fn gcode_line_colour(line: &str) -> Color {
     let trimmed = line.trim_start();
     if trimmed.starts_with(';') {

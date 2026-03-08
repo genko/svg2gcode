@@ -222,7 +222,10 @@ fn main() -> io::Result<()> {
                     dimensions[i] = dimension_origin;
                 });
         }
-        ConversionOptions { dimensions }
+        ConversionOptions {
+            dimensions,
+            ..Default::default()
+        }
     };
 
     let input = match opt.file {

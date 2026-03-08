@@ -31,11 +31,27 @@
 //!   Ctrl-K          → kill to end of line
 //!   Esc             → clear buffer
 //!
-//!  GCODE TAB
+//!  GCODE TAB (GCode pane focused)
 //!   o              → open SVG (blocking rfd dialog)
 //!   c              → convert loaded SVG → GCode
 //!   s              → save GCode to file
+//!   l              → switch focus to Layer panel
 //!   ↑ / ↓ / PgUp / PgDn / Home / End → scroll GCode text
+//!
+//!  GCODE TAB (Layer panel focused)
+//!   ↑ / k          → previous layer
+//!   ↓ / j          → next layer
+//!   f              → edit feedrate of selected layer
+//!   p              → edit power of selected layer
+//!   n              → edit passes of selected layer
+//!   r              → reset all layer overrides to SVG values
+//!   Esc / l        → switch focus back to GCode pane
+//!
+//!  GCODE TAB (Layer field editing)
+//!   printable      → type value
+//!   Backspace      → delete char
+//!   Enter          → confirm value
+//!   Esc            → cancel edit
 //!
 //!  PREVIEW TAB
 //!   p              → render preview image
@@ -47,7 +63,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 
 use crate::{
     app::{
-        ActiveTab, App, AppMode, ControlFocus, ConversionErrorPopup, ConversionStatus, FocusedPane,
+        ActiveTab, App, AppMode, ControlFocus, ConversionStatus, FocusedPane, GCodeFocus,
         MachineSettings,
     },
     converter::{ConversionError, gcode_to_image, laser_bounding_box, svg_to_gcode},
@@ -770,6 +786,19 @@ fn cycle_control_focus_rev(app: &mut App) {
 // ── GCode tab ─────────────────────────────────────────────────────────────────
 
 fn handle_gcode_tab(app: &mut App, key: KeyEvent) -> bool {
+    match app.gcode_focus {
+        GCodeFocus::Layers => {
+            // If a field is being edited, handle typing first
+            if app.layer_edit_field.is_some() {
+                return handle_layer_edit(app, key);
+            }
+            handle_layer_list(app, key)
+        }
+        GCodeFocus::GCode => handle_gcode_pane(app, key),
+    }
+}
+
+fn handle_gcode_pane(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         // Open SVG
         KeyCode::Char('o') | KeyCode::Char('O') => {
@@ -807,6 +836,14 @@ fn handle_gcode_tab(app: &mut App, key: KeyEvent) -> bool {
             true
         }
 
+        // Switch focus to the layer panel
+        KeyCode::Char('l') | KeyCode::Char('L') => {
+            if !app.layers.is_empty() {
+                app.gcode_focus = GCodeFocus::Layers;
+            }
+            true
+        }
+
         // Scroll
         KeyCode::Up | KeyCode::Char('k') => {
             app.gcode_scroll_up();
@@ -833,6 +870,78 @@ fn handle_gcode_tab(app: &mut App, key: KeyEvent) -> bool {
             true
         }
 
+        _ => false,
+    }
+}
+
+fn handle_layer_list(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        // Navigate layers
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.layer_prev();
+            true
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.layer_next();
+            true
+        }
+
+        // Begin editing a field
+        KeyCode::Char('f') | KeyCode::Char('F') => {
+            app.layer_begin_edit(0);
+            true
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            app.layer_begin_edit(1);
+            true
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.layer_begin_edit(2);
+            true
+        }
+
+        // Reset all layer overrides to SVG-baked values
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            app.layer_clear_all();
+            app.set_status("Layer overrides reset to SVG values.", Some(80));
+            true
+        }
+
+        // Return focus to the GCode pane
+        KeyCode::Esc | KeyCode::Char('l') | KeyCode::Char('L') => {
+            app.gcode_focus = GCodeFocus::GCode;
+            true
+        }
+
+        _ => false,
+    }
+}
+
+fn handle_layer_edit(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Enter => {
+            if !app.layer_commit_edit() {
+                // Validation failed – error is shown in the panel, keep editing
+            }
+            true
+        }
+        KeyCode::Esc => {
+            app.layer_cancel_edit();
+            true
+        }
+        KeyCode::Backspace => {
+            app.layer_edit_buf.pop();
+            app.layer_edit_error = None;
+            true
+        }
+        KeyCode::Char(c) => {
+            // Only accept characters that make sense in a numeric input
+            if c.is_ascii_digit() || c == '.' {
+                app.layer_edit_buf.push(c);
+                app.layer_edit_error = None;
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -1287,6 +1396,24 @@ fn do_open_svg(app: &mut App) {
     match chosen {
         Some(path) => {
             app.push_info(format!("Loaded SVG: {}", path.display()));
+            // Extract layers from the SVG content before storing the path
+            if let Ok(svg_text) = std::fs::read_to_string(&path) {
+                app.load_layers_from_svg(&svg_text);
+                let n = app.layers.len();
+                if n > 0 {
+                    app.set_status(
+                        format!(
+                            "SVG loaded – {n} layer(s) detected. Press 'l' to edit, 'c' to convert."
+                        ),
+                        Some(160),
+                    );
+                } else {
+                    app.set_status("SVG loaded. Press 'c' to convert.", Some(120));
+                }
+            } else {
+                app.layers.clear();
+                app.set_status("SVG loaded. Press 'c' to convert.", Some(120));
+            }
             app.svg_path = Some(path);
             // Reset any previous conversion artefacts
             app.gcode_text = None;
@@ -1295,7 +1422,7 @@ fn do_open_svg(app: &mut App) {
             app.preview_image = None;
             app.preview_protocol = None;
             app.preview_dirty = false;
-            app.set_status("SVG loaded. Press 'c' to convert.", Some(120));
+            app.gcode_focus = GCodeFocus::GCode;
         }
         None => {
             app.set_status("No file selected.", Some(60));
@@ -1354,8 +1481,9 @@ fn do_convert(app: &mut App) {
     app.preview_dirty = false;
 
     let settings = app.machine_settings.clone();
+    let layer_overrides = app.layer_override_map();
 
-    match svg_to_gcode(&svg_path, &settings) {
+    match svg_to_gcode(&svg_path, &settings, layer_overrides) {
         Ok(gcode) => {
             let line_count = gcode.lines().count();
             app.push_info(format!("Conversion OK – {} lines of GCode.", line_count));

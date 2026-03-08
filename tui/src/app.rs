@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use image::RgbaImage;
+use svg2gcode::{LayerOverrideOptions, SvgLayerInfo};
 
 use crate::serial::SerialCommand;
 
@@ -228,6 +229,18 @@ impl MachineSettings {
 
 // ── Conversion error popup ────────────────────────────────────────────────────
 
+/// Which pane inside the G-Code tab has keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GCodeFocus {
+    /// GCode text is scrollable (default)
+    #[default]
+    GCode,
+    /// Layer list is active
+    Layers,
+}
+
+// ── Conversion error popup ────────────────────────────────────────────────────
+
 /// Payload for the modal error dialog shown when GCode generation fails
 /// due to a settings or work-area violation.
 #[derive(Debug, Clone)]
@@ -236,6 +249,68 @@ pub struct ConversionErrorPopup {
     pub title: String,
     /// Multi-line detail body.
     pub body: String,
+}
+
+/// Editable per-layer settings for the TUI layer panel.
+///
+/// Mirrors the web `LayerSettings` but stores values directly as `f64`/`u32`
+/// options rather than text strings (the TUI edit buffer is on `App`).
+#[derive(Debug, Clone)]
+pub struct TuiLayerSettings {
+    /// Human-readable label (inkscape:label > id > key).
+    pub label: String,
+    /// Stable lookup key matching [`SvgLayerInfo::key`].
+    pub key: String,
+
+    /// User-override feedrate in mm/min (`None` = use SVG value or global).
+    pub feedrate: Option<f64>,
+    /// User-override laser power S-word (`None` = use SVG value or global).
+    pub power: Option<f64>,
+    /// User-override pass count (`None` = use SVG value or 1).
+    pub passes: Option<u32>,
+
+    /// Value baked into the SVG `data-feedrate` attribute (read-only).
+    pub svg_feedrate: Option<f64>,
+    /// Value baked into the SVG `data-power` attribute (read-only).
+    pub svg_power: Option<f64>,
+    /// Value baked into the SVG `data-passes` attribute (read-only).
+    pub svg_passes: Option<u32>,
+}
+
+impl TuiLayerSettings {
+    pub fn from_svg_layer(info: &SvgLayerInfo, max_feedrate: f64, max_power: f64) -> Self {
+        Self {
+            label: info.label.clone(),
+            key: info.key.clone(),
+            feedrate: info.svg_feedrate.map(|f| f.min(max_feedrate)),
+            power: info.svg_power.map(|p| p.min(max_power)),
+            passes: info.svg_passes,
+            svg_feedrate: info.svg_feedrate,
+            svg_power: info.svg_power,
+            svg_passes: info.svg_passes,
+        }
+    }
+
+    /// Build a [`LayerOverrideOptions`] to pass into the converter.
+    pub fn to_override_options(&self) -> LayerOverrideOptions {
+        LayerOverrideOptions {
+            feedrate: self.feedrate,
+            power: self.power,
+            passes: self.passes,
+        }
+    }
+
+    /// Return a short summary string for the layer list.
+    #[allow(dead_code)]
+    pub fn summary(&self, global_feedrate: f64, global_power: f64) -> String {
+        let f = self
+            .feedrate
+            .or(self.svg_feedrate)
+            .unwrap_or(global_feedrate);
+        let p = self.power.or(self.svg_power).unwrap_or(global_power);
+        let passes = self.passes.or(self.svg_passes).unwrap_or(1);
+        format!("F{:.0} S{:.0} ×{}", f, p, passes)
+    }
 }
 
 // ── Focus / Tab enums ─────────────────────────────────────────────────────────
@@ -394,6 +469,7 @@ pub struct App {
     pub active_tab: ActiveTab,
     pub focused: FocusedPane,
     pub control_focus: ControlFocus,
+    pub gcode_focus: GCodeFocus,
 
     // ── Serial port selection ─────────────────────────────────────────────
     pub port_list: Vec<String>,
@@ -430,6 +506,19 @@ pub struct App {
     pub gcode_scroll: usize,
     /// Current state of the SVG → GCode conversion
     pub conversion_status: ConversionStatus,
+
+    // ── Layer overrides ───────────────────────────────────────────────────
+    /// Per-layer settings extracted from the loaded SVG.
+    pub layers: Vec<TuiLayerSettings>,
+    /// Which layer row is highlighted in the layer panel.
+    pub layer_selected: usize,
+    /// Which field within the selected layer is being edited:
+    /// 0 = feedrate, 1 = power, 2 = passes. `None` = browsing, not editing.
+    pub layer_edit_field: Option<usize>,
+    /// Raw text typed into the layer edit buffer.
+    pub layer_edit_buf: String,
+    /// Validation error for the current layer edit.
+    pub layer_edit_error: Option<String>,
 
     // ── Preview image ─────────────────────────────────────────────────────
     /// RGBA pixel image built by tracing the GCode toolpath (for ratatui-image)
@@ -516,6 +605,7 @@ impl App {
             active_tab: ActiveTab::Connect,
             focused: FocusedPane::SerialList,
             control_focus: ControlFocus::Jog,
+            gcode_focus: GCodeFocus::GCode,
 
             port_list: Vec::new(),
             port_list_state: list_state,
@@ -542,6 +632,12 @@ impl App {
             gcode_text: None,
             gcode_scroll: 0,
             conversion_status: ConversionStatus::Idle,
+
+            layers: Vec::new(),
+            layer_selected: 0,
+            layer_edit_field: None,
+            layer_edit_buf: String::new(),
+            layer_edit_error: None,
 
             preview_image: None,
             preview_protocol: None,
@@ -815,6 +911,180 @@ impl App {
     }
 
     // ── GCode panel scroll helpers ────────────────────────────────────────
+
+    // ── Layer panel helpers ───────────────────────────────────────────────
+
+    /// Load layers from an SVG document, resetting user edits.
+    pub fn load_layers_from_svg(&mut self, svg_text: &str) {
+        use roxmltree::ParsingOptions;
+        use svg2gcode::extract_svg_layers;
+
+        let Ok(doc) = roxmltree::Document::parse_with_options(
+            svg_text,
+            ParsingOptions {
+                allow_dtd: true,
+                ..Default::default()
+            },
+        ) else {
+            self.layers = Vec::new();
+            return;
+        };
+
+        let max_feedrate = self.machine_settings.max_speed;
+        let max_power = self.machine_settings.max_laser_power;
+        self.layers = extract_svg_layers(&doc)
+            .iter()
+            .map(|info| TuiLayerSettings::from_svg_layer(info, max_feedrate, max_power))
+            .collect();
+        self.layer_selected = 0;
+        self.layer_edit_field = None;
+        self.layer_edit_buf.clear();
+        self.layer_edit_error = None;
+    }
+
+    /// Build the `HashMap<String, LayerOverrideOptions>` for the converter.
+    pub fn layer_override_map(&self) -> std::collections::HashMap<String, LayerOverrideOptions> {
+        self.layers
+            .iter()
+            .filter_map(|l| {
+                let opts = l.to_override_options();
+                if opts.feedrate.is_some() || opts.power.is_some() || opts.passes.is_some() {
+                    Some((l.key.clone(), opts))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn layer_next(&mut self) {
+        if !self.layers.is_empty() {
+            self.layer_selected = (self.layer_selected + 1) % self.layers.len();
+            self.layer_edit_field = None;
+            self.layer_edit_buf.clear();
+            self.layer_edit_error = None;
+        }
+    }
+
+    pub fn layer_prev(&mut self) {
+        if !self.layers.is_empty() {
+            self.layer_selected = if self.layer_selected == 0 {
+                self.layers.len() - 1
+            } else {
+                self.layer_selected - 1
+            };
+            self.layer_edit_field = None;
+            self.layer_edit_buf.clear();
+            self.layer_edit_error = None;
+        }
+    }
+
+    /// Begin editing the given field (0=feedrate, 1=power, 2=passes) of the
+    /// selected layer, pre-filling the buffer with the current value.
+    pub fn layer_begin_edit(&mut self, field: usize) {
+        if let Some(layer) = self.layers.get(self.layer_selected) {
+            let val = match field {
+                0 => layer
+                    .feedrate
+                    .map(|f| format!("{f:.0}"))
+                    .unwrap_or_default(),
+                1 => layer.power.map(|p| format!("{p:.0}")).unwrap_or_default(),
+                2 => layer.passes.map(|p| p.to_string()).unwrap_or_default(),
+                _ => return,
+            };
+            self.layer_edit_field = Some(field);
+            self.layer_edit_buf = val;
+            self.layer_edit_error = None;
+        }
+    }
+
+    /// Commit the edit buffer into the selected layer. Returns true on success.
+    pub fn layer_commit_edit(&mut self) -> bool {
+        let Some(field) = self.layer_edit_field else {
+            return true;
+        };
+        let buf = self.layer_edit_buf.trim().to_owned();
+        let max_feedrate = self.machine_settings.max_speed;
+        let max_power = self.machine_settings.max_laser_power;
+
+        if let Some(layer) = self.layers.get_mut(self.layer_selected) {
+            match field {
+                0 => {
+                    if buf.is_empty() {
+                        layer.feedrate = None;
+                    } else {
+                        match buf.parse::<f64>() {
+                            Ok(f) if f >= 0.0 => {
+                                layer.feedrate = Some(f.min(max_feedrate));
+                            }
+                            _ => {
+                                self.layer_edit_error =
+                                    Some(format!("Invalid feedrate (0..{max_feedrate:.0})"));
+                                return false;
+                            }
+                        }
+                    }
+                }
+                1 => {
+                    if buf.is_empty() {
+                        layer.power = None;
+                    } else {
+                        match buf.parse::<f64>() {
+                            Ok(p) if p >= 0.0 => {
+                                layer.power = Some(p.min(max_power));
+                            }
+                            _ => {
+                                self.layer_edit_error =
+                                    Some(format!("Invalid power (0..{max_power:.0})"));
+                                return false;
+                            }
+                        }
+                    }
+                }
+                2 => {
+                    if buf.is_empty() {
+                        layer.passes = None;
+                    } else {
+                        match buf.parse::<u32>() {
+                            Ok(p) if p >= 1 => {
+                                layer.passes = Some(p);
+                            }
+                            _ => {
+                                self.layer_edit_error =
+                                    Some("Passes must be a whole number ≥ 1".to_owned());
+                                return false;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        self.layer_edit_field = None;
+        self.layer_edit_buf.clear();
+        self.layer_edit_error = None;
+        true
+    }
+
+    /// Cancel the current layer field edit without applying it.
+    pub fn layer_cancel_edit(&mut self) {
+        self.layer_edit_field = None;
+        self.layer_edit_buf.clear();
+        self.layer_edit_error = None;
+    }
+
+    /// Clear all user overrides for every layer.
+    pub fn layer_clear_all(&mut self) {
+        for layer in &mut self.layers {
+            layer.feedrate = layer.svg_feedrate;
+            layer.power = layer.svg_power;
+            layer.passes = layer.svg_passes;
+        }
+        self.layer_edit_field = None;
+        self.layer_edit_buf.clear();
+        self.layer_edit_error = None;
+    }
 
     pub fn gcode_line_count(&self) -> usize {
         self.gcode_text

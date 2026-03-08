@@ -43,6 +43,14 @@ pub struct MachineConfig {
     pub tool_off_sequence: Option<String>,
     pub begin_sequence: Option<String>,
     pub end_sequence: Option<String>,
+    /// Maximum allowed feedrate in mm/min.
+    /// When set, per-layer feedrate values (from the SVG or the UI) are clamped to this limit.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub max_feedrate: Option<f64>,
+    /// Maximum allowed laser power S-word value (firmware-specific range, e.g. 0–1000 for GRBL).
+    /// When set, per-layer power values (from the SVG or the UI) are clamped to this limit.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub max_power: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]

@@ -22,7 +22,8 @@ pub use laser_bb::laser_bounding_box;
 
 use roxmltree::ParsingOptions;
 use svg2gcode::{
-    ConversionConfig, ConversionOptions, Machine, SupportedFunctionality, svg2program,
+    ConversionConfig, ConversionOptions, LayerOverrideOptions, Machine, SupportedFunctionality,
+    svg2program,
 };
 
 use crate::app::MachineSettings;
@@ -189,7 +190,11 @@ fn validate_extents(
 /// Returns a [`ConversionError`] (wrapped in `anyhow`) when:
 /// - Settings are invalid (bad feedrate, power out of range, …)
 /// - The generated toolpath exceeds the configured work area
-pub fn svg_to_gcode(svg_path: &Path, settings: &MachineSettings) -> Result<String> {
+pub fn svg_to_gcode(
+    svg_path: &Path,
+    settings: &MachineSettings,
+    layer_overrides: std::collections::HashMap<String, LayerOverrideOptions>,
+) -> Result<String> {
     let svg_text = std::fs::read_to_string(svg_path)
         .with_context(|| format!("Cannot read SVG file: {}", svg_path.display()))?;
 
@@ -240,6 +245,7 @@ pub fn svg_to_gcode(svg_path: &Path, settings: &MachineSettings) -> Result<Strin
 
     let options = ConversionOptions {
         dimensions: [None, None],
+        layer_overrides,
     };
 
     // Validate settings before doing any heavy work.

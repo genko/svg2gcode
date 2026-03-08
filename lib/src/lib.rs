@@ -11,7 +11,10 @@ mod postprocess;
 /// This concept is referred to as [Turtle graphics](https://en.wikipedia.org/wiki/Turtle_graphics).
 mod turtle;
 
-pub use converter::{ConversionConfig, ConversionOptions, svg2program};
+pub use converter::{
+    ConversionConfig, ConversionOptions, LayerOverrideOptions, SvgLayerInfo, extract_svg_layers,
+    svg_layer_key, svg2program,
+};
 pub use machine::{Machine, MachineConfig, SupportedFunctionality};
 pub use postprocess::PostprocessConfig;
 pub use turtle::Turtle;
@@ -113,7 +116,10 @@ mod test {
         dimensions: [Option<Length>; 2],
     ) -> Vec<Token<'_>> {
         let config = ConversionConfig::default();
-        let options = ConversionOptions { dimensions };
+        let options = ConversionOptions {
+            dimensions,
+            ..Default::default()
+        };
         let document = roxmltree::Document::parse_with_options(
             input,
             ParsingOptions {
