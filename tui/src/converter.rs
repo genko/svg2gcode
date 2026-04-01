@@ -8,6 +8,7 @@
 //!   renders them into an [`image::RgbaImage`] that ratatui-image can display.
 
 use std::f64::consts::PI;
+use std::fmt::Write as FmtWrite;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -1256,4 +1257,282 @@ pub fn svg_to_image(svg_path: &Path, max_w: u32, max_h: u32) -> Result<RgbaImage
     }
 
     Ok(rgba)
+}
+
+/// Load a PNG (or any image format supported by the `image` crate) and return
+/// a scaled-down RGBA preview image that fits within `max_w × max_h` pixels.
+/// Used to display the source image in the Preview tab left panel.
+pub fn png_to_preview_image(png_path: &Path, max_w: u32, max_h: u32) -> Result<RgbaImage> {
+    let img = image::open(png_path)
+        .with_context(|| format!("Cannot open image: {}", png_path.display()))?;
+    let (w, h) = (img.width(), img.height());
+    if w <= max_w && h <= max_h {
+        Ok(img.to_rgba8())
+    } else {
+        let scale = (max_w as f64 / w as f64).min(max_h as f64 / h as f64);
+        let new_w = ((w as f64 * scale).round() as u32).max(1);
+        let new_h = ((h as f64 * scale).round() as u32).max(1);
+        Ok(img
+            .resize(new_w, new_h, image::imageops::FilterType::Triangle)
+            .to_rgba8())
+    }
+}
+
+/// Convert a greyscale image (PNG, JPEG, or any format the `image` crate
+/// supports) to a raster-scan laser-engraver GCode program.
+///
+/// Design decisions:
+/// - Each pixel maps to exactly one beam-width step in X and Y.
+/// - Black (luma 0)     → S = `settings.laser_power` (maximum power).
+/// - White (luma max)   → S = 0 (laser off).
+/// - Transparent pixels are treated as white (no power).
+/// - **Bit-depth-aware**: the image is converted to 16-bit RGBA internally so
+///   that 16-bit PNGs retain all 65 536 grey levels instead of being crushed
+///   to 256.  8-bit images produce numerically equivalent results (channels are
+///   scaled ×257, preserving the normalised value).  The S word is
+///   interpolated linearly across the full dynamic range of the source:
+///   `S = round(max_power × darkness)` where `darkness ∈ [0.0, 1.0]`.
+/// - Scanning is boustrophedon (left↔right alternating) to minimise head travel.
+/// - Runs of fully-off (S=0) pixels are skipped with G0 rapids.
+/// - F (feedrate) is emitted only on the very first G1; it is modal in G-code.
+/// - S is emitted on every G1 where the power differs from the previous G1.
+/// - `origin_x / origin_y` from `settings` maps to the **bottom-left** corner
+///   of the image in machine coordinates (same convention as SVG conversion).
+pub fn png_to_gcode(png_path: &Path, settings: &MachineSettings, invert: bool) -> Result<String> {
+    // Validate common settings first.
+    validate_settings(settings).map_err(|e| anyhow::anyhow!(e))?;
+
+    // ── Load image ────────────────────────────────────────────────────────
+    let img = image::open(png_path)
+        .with_context(|| format!("Cannot open image: {}", png_path.display()))?;
+
+    // Convert to 16-bit RGBA for bit-depth-aware processing:
+    //   • 16-bit source images  → native channel values (0–65535) are preserved.
+    //   • 8-bit source images   → each channel scaled ×257 so that the
+    //     normalised value is identical: 0/255 = 0/65535, 255/255 = 65535/65535.
+    // This means 16-bit PNGs keep all 65 536 grey levels instead of being
+    // crushed to 256, giving smoother S-word interpolation.
+    let rgba16 = img.into_rgba16();
+    let (width, height) = rgba16.dimensions();
+
+    if width == 0 || height == 0 {
+        anyhow::bail!("Image has zero dimensions ({} × {})", width, height);
+    }
+
+    let pixel_mm = settings.beam_width;
+    if pixel_mm <= 0.0 {
+        anyhow::bail!(
+            "Beam width must be > 0 mm (currently {:.4} mm). \
+             Adjust it in the Settings tab.",
+            pixel_mm
+        );
+    }
+
+    let max_s = settings.laser_power;
+    let img_w_mm = width as f64 * pixel_mm;
+    let img_h_mm = height as f64 * pixel_mm;
+    let job_x_max = settings.origin_x + img_w_mm;
+    let job_y_max = settings.origin_y + img_h_mm;
+
+    // ── Work-area check ───────────────────────────────────────────────────
+    {
+        let mut problems: Vec<String> = Vec::new();
+        if job_x_max > settings.max_x_mm {
+            problems.push(format!(
+                "• Job reaches X {:.1} mm but machine limit is {:.1} mm \
+                 (overrun by {:.1} mm)",
+                job_x_max,
+                settings.max_x_mm,
+                job_x_max - settings.max_x_mm,
+            ));
+        }
+        if job_y_max > settings.max_y_mm {
+            problems.push(format!(
+                "• Job reaches Y {:.1} mm but machine limit is {:.1} mm \
+                 (overrun by {:.1} mm)",
+                job_y_max,
+                settings.max_y_mm,
+                job_y_max - settings.max_y_mm,
+            ));
+        }
+        if !problems.is_empty() {
+            let body = format!(
+                "Image: {} × {} px @ {:.3} mm/px → {:.1} × {:.1} mm\n\
+                 Origin: ({:.1}, {:.1})  →  job reaches ({:.1}, {:.1}) mm\n\
+                 Work area: {:.1} × {:.1} mm\n\n\
+                 Reduce beam width, scale the image, or adjust the origin.\n\n\
+                 {}",
+                width,
+                height,
+                pixel_mm,
+                img_w_mm,
+                img_h_mm,
+                settings.origin_x,
+                settings.origin_y,
+                job_x_max,
+                job_y_max,
+                settings.max_x_mm,
+                settings.max_y_mm,
+                problems.join("\n"),
+            );
+            return Err(anyhow::anyhow!(ConversionError {
+                title: "Image exceeds work area".into(),
+                body,
+            }));
+        }
+    }
+
+    // ── Build darkness matrix (bit-depth-aware) ───────────────────────────
+    // darkness[row][col] ∈ [0.0, 1.0]:
+    //   0.0 → fully white / transparent → S = 0  (laser off)
+    //   1.0 → fully black               → S = max_laser_power
+    //
+    // All channel arithmetic is done in 16-bit space (0–65535) so that
+    // 16-bit source images benefit from full dynamic range, while 8-bit
+    // images produce numerically equivalent results to the old path.
+    //
+    // Alpha threshold: < 32768 in 16-bit ≡ < 128 in 8-bit (50 %).
+    let darkness: Vec<Vec<f64>> = (0..height)
+        .map(|row| {
+            (0..width)
+                .map(|col| {
+                    let [r, g, b, a] = rgba16.get_pixel(col, row).0;
+                    if a < 32768 {
+                        0.0_f64 // transparent → no power
+                    } else {
+                        // BT.601 luma in 16-bit space.
+                        // Normal mode  (invert=false): black → full power, white → no power.
+                        // Inverted mode (invert=true) : white → full power, black → no power.
+                        // Use this for materials that become *lighter* when lasered
+                        // (e.g. anodised aluminium, dark stone) so the image looks correct.
+                        let luma = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
+                        if invert {
+                            luma / 65535.0
+                        } else {
+                            1.0 - luma / 65535.0
+                        }
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    // ── GCode emission ────────────────────────────────────────────────────
+    let cap = ((width as usize * height as usize).min(5_000_000)) * 18;
+    let mut out = String::with_capacity(cap);
+
+    writeln!(out, "G21 ; millimeters")?;
+    writeln!(out, "G90 ; absolute mode")?;
+
+    // Begin sequence with S0 so laser starts off; we control power per-pixel.
+    let begin = format!("{} S0", settings.sanitised_begin_sequence());
+    for raw in begin.lines() {
+        let l = raw.trim();
+        if !l.is_empty() {
+            writeln!(out, "{}", l)?;
+        }
+    }
+
+    // F is modal in G-code: emit it only on the very first G1 in the job.
+    let mut feedrate_emitted = false;
+
+    for row in 0..(height as usize) {
+        let row_dark = &darkness[row];
+        // origin_y is the bottom-left corner of the image (consistent with SVG
+        // convention). Row 0 = image top → highest Y; row height-1 = image
+        // bottom → origin_y.
+        let y_mm = settings.origin_y + (height as usize - 1 - row) as f64 * pixel_mm;
+
+        // Skip entirely white / transparent rows (all darkness values are 0.0).
+        if row_dark.iter().all(|&d| d == 0.0) {
+            continue;
+        }
+
+        // Boustrophedon: even rows left→right, odd rows right→left.
+        let forward = row % 2 == 0;
+
+        // Build (col_index, s_value) pairs in scan order.
+        // s = round1dp(max_s * darkness): 0.0 for white, max_s for black.
+        // Rounding to 1 decimal suppresses floating-point noise while still
+        // providing ~10 000 distinct S levels for a 0–1000 S range.
+        let scan: Vec<(usize, f64)> = if forward {
+            (0..width as usize)
+                .map(|c| (c, round1dp(max_s * row_dark[c])))
+                .collect()
+        } else {
+            (0..width as usize)
+                .rev()
+                .map(|c| (c, round1dp(max_s * row_dark[c])))
+                .collect()
+        };
+
+        // Find index of first non-zero S in scan order.
+        let first_nz = match scan.iter().position(|(_, s)| *s > 0.0) {
+            Some(i) => i,
+            None => continue, // safety – all-white row (shouldn't happen after above check)
+        };
+
+        // Rapid to the first active pixel.
+        let first_x = settings.origin_x + scan[first_nz].0 as f64 * pixel_mm;
+        writeln!(out, "G0 X{:.3} Y{:.3}", first_x, y_mm)?;
+
+        let mut i = first_nz;
+        let mut last_s: Option<f64> = None;
+
+        while i < scan.len() {
+            let (col, s) = scan[i];
+            let x_mm = settings.origin_x + col as f64 * pixel_mm;
+
+            if s == 0.0 {
+                // Find the next non-zero pixel.
+                let next_nz = scan[i..].iter().position(|(_, s)| *s > 0.0);
+                match next_nz {
+                    None => break, // rest of row is off – done
+                    Some(offset) => {
+                        let next_i = i + offset;
+                        let next_x = settings.origin_x + scan[next_i].0 as f64 * pixel_mm;
+                        // G0 within a row (same Y) to skip the white run.
+                        writeln!(out, "G0 X{:.3}", next_x)?;
+                        // After G0 we must re-emit S on the next G1.
+                        last_s = None;
+                        i = next_i;
+                        continue;
+                    }
+                }
+            }
+
+            // Non-zero power: emit G1.
+            if !feedrate_emitted {
+                writeln!(out, "G1 X{:.3} S{:.1} F{:.0}", x_mm, s, settings.feedrate)?;
+                feedrate_emitted = true;
+            } else if Some(s) != last_s {
+                writeln!(out, "G1 X{:.3} S{:.1}", x_mm, s)?;
+            } else {
+                writeln!(out, "G1 X{:.3}", x_mm)?;
+            }
+            last_s = Some(s);
+            i += 1;
+        }
+    }
+
+    // Park at origin and run end sequence.
+    writeln!(
+        out,
+        "G0 X{:.3} Y{:.3}",
+        settings.origin_x, settings.origin_y
+    )?;
+    for raw in settings.end_sequence.lines() {
+        let l = raw.trim();
+        if !l.is_empty() {
+            writeln!(out, "{}", l)?;
+        }
+    }
+
+    Ok(out)
+}
+
+/// Round a float to 1 decimal place (reduces noise in S-word emission).
+#[inline]
+fn round1dp(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
 }

@@ -525,17 +525,20 @@ fn render_baud_dropdown(app: &App, frame: &mut Frame, screen: Rect) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn render_gcode_tab(app: &App, frame: &mut Frame, area: Rect) {
-    // If there are layers, split horizontally: left = gcode, right = layer panel
+    // Controls block needs 2 extra rows for the border, plus 1 extra when an
+    // image source info line is shown.
+    // 5 content lines for SVG (+ 2 border = 7), 6 for PNG (+ 2 border = 8).
+    // Both get one extra row for the workpiece-offset line.
+    let ctrl_h: u16 = if app.is_image_source { 8 } else { 7 };
+
     if app.layers.is_empty() {
-        // No layers: full-width layout
         let v = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(4), Constraint::Min(0)])
+            .constraints([Constraint::Length(ctrl_h), Constraint::Min(0)])
             .split(area);
         render_gcode_controls(app, frame, v[0]);
         render_gcode_text(app, frame, v[1]);
     } else {
-        // With layers: left column (gcode) + right column (layer panel)
         let h = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(0), Constraint::Length(36)])
@@ -543,7 +546,7 @@ fn render_gcode_tab(app: &App, frame: &mut Frame, area: Rect) {
 
         let v = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(4), Constraint::Min(0)])
+            .constraints([Constraint::Length(ctrl_h), Constraint::Min(0)])
             .split(h[0]);
 
         render_gcode_controls(app, frame, v[0]);
@@ -553,7 +556,7 @@ fn render_gcode_tab(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_gcode_controls(app: &App, frame: &mut Frame, area: Rect) {
-    let svg_label = app
+    let file_label = app
         .svg_path
         .as_deref()
         .and_then(|p| p.file_name())
@@ -583,11 +586,169 @@ fn render_gcode_controls(app: &App, frame: &mut Frame, area: Rect) {
         .map(|t| t.lines().count())
         .unwrap_or(0);
 
-    let content = vec![
+    // Line 3: settings summary (differs for SVG vs image).
+    let settings_line = if app.is_image_source {
+        let invert_label = if app.invert_image {
+            "ON  (white pixels fire laser)"
+        } else {
+            "off (black pixels fire laser)"
+        };
         Line::from(vec![
-            Span::styled("  SVG:    ", Style::default().fg(C_INFO)),
             Span::styled(
-                svg_label,
+                format!(
+                    "  Feed:{:.0}mm/m  Beam:{:.3}mm/px  Power:{:.0}S  Invert:",
+                    app.machine_settings.feedrate,
+                    app.machine_settings.beam_width,
+                    app.machine_settings.laser_power,
+                ),
+                Style::default().fg(C_INFO),
+            ),
+            Span::styled(
+                invert_label,
+                if app.invert_image {
+                    Style::default().fg(C_WARN).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(C_INFO)
+                },
+            ),
+        ])
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "  Feed:{:.0}mm/m  Tol:{:.3}mm  DPI:{:.0}  Power:{:.0}",
+                app.machine_settings.feedrate,
+                app.machine_settings.tolerance,
+                app.machine_settings.dpi,
+                app.machine_settings.laser_power,
+            ),
+            Style::default().fg(C_INFO),
+        ))
+    };
+
+    // Line 4 (PNG only): image pixel→mm info + fit check.
+    let image_info_line: Option<Line> = if app.is_image_source {
+        let beam = app.machine_settings.beam_width;
+        let ox = app.machine_settings.origin_x;
+        let oy = app.machine_settings.origin_y;
+        let line = match app.image_dimensions {
+            Some((w, h)) => {
+                let w_mm = w as f64 * beam;
+                let h_mm = h as f64 * beam;
+                let x_max = ox + w_mm;
+                let y_max = oy + h_mm;
+                let fits = x_max <= app.machine_settings.max_x_mm
+                    && y_max <= app.machine_settings.max_y_mm;
+                let (icon, col) = if fits { ("✓", C_OK) } else { ("⚠", C_ERR) };
+                Line::from(Span::styled(
+                    format!(
+                        "  Image:  {}×{}px → {:.1}×{:.1}mm  {} fits in {:.0}×{:.0}mm",
+                        w,
+                        h,
+                        w_mm,
+                        h_mm,
+                        icon,
+                        app.machine_settings.max_x_mm,
+                        app.machine_settings.max_y_mm,
+                    ),
+                    Style::default().fg(col),
+                ))
+            }
+            None => Line::from(Span::styled(
+                "  Image:  (unknown dimensions – reload file)",
+                Style::default().fg(C_WARN),
+            )),
+        };
+        Some(line)
+    } else {
+        None
+    };
+
+    // Line 4/5: workpiece offset — shows edit UI when active, static info otherwise.
+    let ox = app.machine_settings.origin_x;
+    let oy = app.machine_settings.origin_y;
+    let offset_line = match app.offset_edit {
+        Some(axis) => {
+            let axis_name = if axis == 0 { "X" } else { "Y" };
+            let err_suffix = app
+                .offset_edit_error
+                .as_deref()
+                .map(|e| format!("  ← {}", e))
+                .unwrap_or_default();
+            let err_col = if app.offset_edit_error.is_some() {
+                C_ERR
+            } else {
+                C_INFO
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!("  Offset {}: [ ", axis_name),
+                    Style::default().fg(C_INFO),
+                ),
+                Span::styled(
+                    format!("{}_", app.offset_edit_buf),
+                    Style::default().fg(C_HL).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" ]  Enter=confirm  Esc=cancel{}", err_suffix),
+                    Style::default().fg(err_col),
+                ),
+            ])
+        }
+        None => Line::from(Span::styled(
+            format!(
+                "  Offset:  X={:.1}mm  Y={:.1}mm   x: edit X   y: edit Y",
+                ox, oy,
+            ),
+            Style::default().fg(C_INFO),
+        )),
+    };
+
+    // Last line: keymap hint or streaming progress bar.
+    let hint_line = if app.is_streaming {
+        let pct = if app.stream_total > 0 {
+            (app.stream_sent * 100) / app.stream_total
+        } else {
+            0
+        };
+        let bar_w = 20usize;
+        let filled = (pct * bar_w) / 100;
+        let bar = format!(
+            "{}{}",
+            "█".repeat(filled),
+            "░".repeat(bar_w.saturating_sub(filled))
+        );
+        Line::from(vec![
+            Span::styled(
+                "  Streaming: ",
+                Style::default().fg(C_WARN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(bar, Style::default().fg(C_OK)),
+            Span::styled(
+                format!(
+                    " {}/{} ({}%)  a:abort",
+                    app.stream_sent, app.stream_total, pct
+                ),
+                Style::default().fg(C_WARN),
+            ),
+        ])
+    } else if app.is_image_source {
+        Line::from(Span::styled(
+            "  o:open SVG/PNG  i:invert  c:conv  s:save  g:send  f:frame  x/y:offset  ↑↓/PgUp/Dn:scroll",
+            Style::default().fg(C_INFO),
+        ))
+    } else {
+        Line::from(Span::styled(
+            "  o:open SVG/PNG  c:conv  s:save  g:send  f:frame  l:layers  x/y:offset  ↑↓/PgUp/Dn:scroll",
+            Style::default().fg(C_INFO),
+        ))
+    };
+
+    // Assemble content vector (image_info_line inserted only for PNG).
+    let mut content = vec![
+        Line::from(vec![
+            Span::styled("  File:   ", Style::default().fg(C_INFO)),
+            Span::styled(
+                file_label,
                 Style::default().fg(C_TITLE).add_modifier(Modifier::BOLD),
             ),
         ]),
@@ -599,51 +760,13 @@ fn render_gcode_controls(app: &App, frame: &mut Frame, area: Rect) {
                 Style::default().fg(C_INFO),
             ),
         ]),
-        Line::from(vec![Span::styled(
-            format!(
-                "  Feed:{:.0}mm/m  Tol:{:.3}mm  DPI:{:.0}  Power:{:.0}",
-                app.machine_settings.feedrate,
-                app.machine_settings.tolerance,
-                app.machine_settings.dpi,
-                app.machine_settings.laser_power,
-            ),
-            Style::default().fg(C_INFO),
-        )]),
-        if app.is_streaming {
-            // Show a progress bar while streaming
-            let pct = if app.stream_total > 0 {
-                (app.stream_sent * 100) / app.stream_total
-            } else {
-                0
-            };
-            let bar_w = 20usize;
-            let filled = (pct * bar_w) / 100;
-            let bar = format!(
-                "{}{}",
-                "█".repeat(filled),
-                "░".repeat(bar_w.saturating_sub(filled))
-            );
-            Line::from(vec![
-                Span::styled(
-                    "  Streaming: ",
-                    Style::default().fg(C_WARN).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(bar, Style::default().fg(C_OK)),
-                Span::styled(
-                    format!(
-                        " {}/{} ({}%)  a:abort",
-                        app.stream_sent, app.stream_total, pct
-                    ),
-                    Style::default().fg(C_WARN),
-                ),
-            ])
-        } else {
-            Line::from(vec![Span::styled(
-                "  o:open SVG   c:convert   s:save   g:send   f:frame job   l:layers   ↑↓/PgUp/Dn:scroll",
-                Style::default().fg(C_INFO),
-            )])
-        },
+        settings_line,
     ];
+    if let Some(img_line) = image_info_line {
+        content.push(img_line);
+    }
+    content.push(offset_line);
+    content.push(hint_line);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -998,9 +1121,15 @@ fn render_preview_tab(app: &mut App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_svg_preview_panel(app: &mut App, frame: &mut Frame, area: Rect) {
+    let title = if app.is_image_source {
+        " Source Image "
+    } else {
+        " Source SVG "
+    };
+
     let block = Block::default()
         .title(Span::styled(
-            " Source SVG ",
+            title,
             Style::default().fg(C_TITLE).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -1010,15 +1139,20 @@ fn render_svg_preview_panel(app: &mut App, frame: &mut Frame, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Render the image if we have a protocol state
     if let Some(proto) = app.preview_protocol.as_mut() {
         let image_widget = ratatui_image::StatefulImage::default();
         frame.render_stateful_widget(image_widget, inner, proto);
     } else {
-        let hint = if app.svg_path.is_some() {
-            "  Press 'p' to render preview"
+        let hint = if app.is_image_source {
+            if app.svg_path.is_some() {
+                "  Loading image preview…"
+            } else {
+                "  Load an image (GCode tab → 'o')"
+            }
+        } else if app.svg_path.is_some() {
+            "  SVG preview: press 'p' after converting"
         } else {
-            "  Load an SVG first (GCode tab → 'o')"
+            "  Load an SVG or PNG (GCode tab → 'o')"
         };
         frame.render_widget(
             Paragraph::new(vec![
@@ -2027,7 +2161,7 @@ pub fn render_conversion_error_popup(popup: &ConversionErrorPopup, frame: &mut F
 pub fn render_help_overlay(frame: &mut Frame) {
     let area = frame.area();
     let width = 60u16.min(area.width);
-    let height = 58u16.min(area.height);
+    let height = 62u16.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect {
@@ -2116,11 +2250,11 @@ pub fn render_help_overlay(frame: &mut Frame) {
             Style::default().fg(C_HL).add_modifier(Modifier::UNDERLINED),
         )),
         Line::from(Span::styled(
-            "  o          Open SVG file (file picker)",
+            "  o          Open SVG or image file (PNG/JPEG/…)",
             Style::default().fg(C_TITLE),
         )),
         Line::from(Span::styled(
-            "  c          Convert loaded SVG to GCode",
+            "  c          Convert loaded SVG/image to GCode",
             Style::default().fg(C_TITLE),
         )),
         Line::from(Span::styled(
@@ -2137,6 +2271,14 @@ pub fn render_help_overlay(frame: &mut Frame) {
         )),
         Line::from(Span::styled(
             "  f          Frame job: trace laser bounding box with laser off (S0)",
+            Style::default().fg(C_TITLE),
+        )),
+        Line::from(Span::styled(
+            "  x          Edit workpiece X offset (mm) inline",
+            Style::default().fg(C_TITLE),
+        )),
+        Line::from(Span::styled(
+            "  y          Edit workpiece Y offset (mm) inline",
             Style::default().fg(C_TITLE),
         )),
         Line::from(Span::styled(

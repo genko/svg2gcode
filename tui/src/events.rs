@@ -66,7 +66,10 @@ use crate::{
         ActiveTab, App, AppMode, ControlFocus, ConversionStatus, FocusedPane, GCodeFocus,
         MachineSettings,
     },
-    converter::{ConversionError, gcode_to_image, laser_bounding_box, svg_to_gcode},
+    converter::{
+        ConversionError, gcode_to_image, laser_bounding_box, png_to_gcode, png_to_preview_image,
+        svg_to_gcode,
+    },
     grbl::{GrblLine, JogDir},
     serial::{SerialCommand, SerialEvent, discover_ports, spawn_serial_actor, validate_port_path},
 };
@@ -799,10 +802,28 @@ fn handle_gcode_tab(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_gcode_pane(app: &mut App, key: KeyEvent) -> bool {
+    // When offset edit is active, all keystrokes go to the edit handler.
+    if app.offset_edit.is_some() {
+        return handle_offset_edit(app, key);
+    }
+
     match key.code {
         // Open SVG
         KeyCode::Char('o') | KeyCode::Char('O') => {
             do_open_svg(app);
+            true
+        }
+
+        // Toggle colour invert (image sources only)
+        KeyCode::Char('i') | KeyCode::Char('I') => {
+            if app.is_image_source {
+                app.invert_image = !app.invert_image;
+                let state = if app.invert_image { "ON" } else { "OFF" };
+                app.set_status(
+                    format!("Colour invert: {}  – press 'c' to re-convert", state),
+                    Some(120),
+                );
+            }
             true
         }
 
@@ -844,6 +865,24 @@ fn handle_gcode_pane(app: &mut App, key: KeyEvent) -> bool {
             true
         }
 
+        // Workpiece offset quick-edit (x = X axis, y = Y axis)
+        KeyCode::Char('x') | KeyCode::Char('X') => {
+            app.begin_offset_edit(0);
+            app.set_status(
+                "Editing workpiece X offset – type mm value, Enter to confirm, Esc to cancel.",
+                Some(160),
+            );
+            true
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.begin_offset_edit(1);
+            app.set_status(
+                "Editing workpiece Y offset – type mm value, Enter to confirm, Esc to cancel.",
+                Some(160),
+            );
+            true
+        }
+
         // Scroll
         KeyCode::Up | KeyCode::Char('k') => {
             app.gcode_scroll_up();
@@ -870,6 +909,42 @@ fn handle_gcode_pane(app: &mut App, key: KeyEvent) -> bool {
             true
         }
 
+        _ => false,
+    }
+}
+
+fn handle_offset_edit(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Enter => {
+            app.commit_offset_edit();
+            if app.offset_edit_error.is_none() {
+                let ox = app.machine_settings.origin_x;
+                let oy = app.machine_settings.origin_y;
+                app.set_status(
+                    format!("Workpiece offset set: X={:.1}mm  Y={:.1}mm", ox, oy),
+                    Some(100),
+                );
+            }
+            true
+        }
+        KeyCode::Esc => {
+            app.cancel_offset_edit();
+            app.set_status("Offset edit cancelled.", Some(60));
+            true
+        }
+        KeyCode::Backspace => {
+            if !app.offset_edit_buf.is_empty() {
+                app.offset_edit_buf.pop();
+                app.offset_edit_error = None;
+            }
+            true
+        }
+        // Accept digits, dot, minus (for future negative support)
+        KeyCode::Char(c) if c.is_ascii_digit() || c == '.' || c == '-' => {
+            app.offset_edit_buf.push(c);
+            app.offset_edit_error = None;
+            true
+        }
         _ => false,
     }
 }
@@ -1236,7 +1311,7 @@ fn do_frame_job(app: &mut App) {
     let gcode = match &app.gcode_text {
         Some(g) => g.clone(),
         None => {
-            app.push_error("No GCode to frame. Convert an SVG first.");
+            app.push_error("No GCode to frame. Convert a file first.");
             app.set_status("No GCode available.", Some(80));
             return;
         }
@@ -1411,71 +1486,125 @@ fn do_open_svg(app: &mut App) {
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
 
-    let chosen = native_file_open_svg();
+    let chosen = native_file_open_source();
 
     // Restore terminal
     let _ = crossterm::terminal::enable_raw_mode();
     let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
     app.needs_clear = true;
 
-    match chosen {
-        Some(path) => {
-            app.push_info(format!("Loaded SVG: {}", path.display()));
-            // Extract layers from the SVG content before storing the path
-            if let Ok(svg_text) = std::fs::read_to_string(&path) {
-                app.load_layers_from_svg(&svg_text);
-                let n = app.layers.len();
-                if n > 0 {
-                    app.set_status(
-                        format!(
-                            "SVG loaded – {n} layer(s) detected. Press 'l' to edit, 'c' to convert."
-                        ),
-                        Some(160),
-                    );
-                } else {
-                    app.set_status("SVG loaded. Press 'c' to convert.", Some(120));
-                }
+    let Some(path) = chosen else {
+        app.set_status("No file selected.", Some(60));
+        return;
+    };
+
+    // Detect whether the chosen file is a raster image or an SVG by extension.
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_image = matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "bmp" | "gif" | "tiff" | "tif" | "webp"
+    );
+
+    // Reset common state regardless of source type.
+    app.gcode_text = None;
+    app.gcode_scroll = 0;
+    app.conversion_status = ConversionStatus::Idle;
+    app.preview_image = None;
+    app.preview_protocol = None;
+    app.preview_dirty = false;
+    app.gcode_preview_image = None;
+    app.gcode_preview_protocol = None;
+    app.gcode_focus = GCodeFocus::GCode;
+    app.cancel_offset_edit();
+
+    if is_image {
+        // ── Raster image (PNG / JPEG / …) ─────────────────────────────────
+        app.is_image_source = true;
+        app.layers.clear();
+
+        // Load pixel dimensions and a scaled preview image.
+        match png_to_preview_image(&path, 800, 600) {
+            Ok(img) => {
+                app.image_dimensions = Some((img.width(), img.height()));
+                // The main loop converts this into a StatefulProtocol on the
+                // next tick so the left preview panel shows the source image.
+                app.preview_image = Some(img);
+                app.preview_dirty = true;
+            }
+            Err(e) => {
+                app.image_dimensions = None;
+                app.push_error(format!("Could not load image preview: {e}"));
+            }
+        }
+
+        app.svg_path = Some(path.clone());
+        app.push_info(format!("Loaded image: {}", path.display()));
+        let dims = app
+            .image_dimensions
+            .map(|(w, h)| format!("{w}×{h}px"))
+            .unwrap_or_default();
+        app.set_status(
+            format!("Image loaded ({dims}). Press 'c' to convert."),
+            Some(160),
+        );
+    } else {
+        // ── SVG ────────────────────────────────────────────────────────────
+        app.is_image_source = false;
+        app.image_dimensions = None;
+
+        if let Ok(svg_text) = std::fs::read_to_string(&path) {
+            app.load_layers_from_svg(&svg_text);
+            let n = app.layers.len();
+            if n > 0 {
+                app.set_status(
+                    format!(
+                        "SVG loaded – {n} layer(s) detected. Press 'l' to edit, 'c' to convert."
+                    ),
+                    Some(160),
+                );
             } else {
-                app.layers.clear();
                 app.set_status("SVG loaded. Press 'c' to convert.", Some(120));
             }
-            app.svg_path = Some(path);
-            // Reset any previous conversion artefacts
-            app.gcode_text = None;
-            app.gcode_scroll = 0;
-            app.conversion_status = ConversionStatus::Idle;
-            app.preview_image = None;
-            app.preview_protocol = None;
-            app.preview_dirty = false;
-            app.gcode_preview_image = None;
-            app.gcode_preview_protocol = None;
-            app.gcode_focus = GCodeFocus::GCode;
+        } else {
+            app.layers.clear();
+            app.set_status("SVG loaded. Press 'c' to convert.", Some(120));
         }
-        None => {
-            app.set_status("No file selected.", Some(60));
-        }
+
+        app.svg_path = Some(path.clone());
+        app.push_info(format!("Loaded SVG: {}", path.display()));
     }
 }
 
-/// Attempt to open a native GTK/macOS/Windows file picker.
+/// Attempt to open a native GTK/macOS/Windows file picker for SVG or image files.
 /// Falls back to a simple prompt read from stderr/stdin when unavailable.
-fn native_file_open_svg() -> Option<std::path::PathBuf> {
+fn native_file_open_source() -> Option<std::path::PathBuf> {
     // rfd::FileDialog is synchronous on Linux (via GTK).
-    // It blocks until the user picks or cancels.
     let result = std::panic::catch_unwind(|| {
         rfd::FileDialog::new()
+            .add_filter(
+                "SVG & image files",
+                &["svg", "SVG", "png", "PNG", "jpg", "jpeg", "JPG", "JPEG"],
+            )
             .add_filter("SVG files", &["svg", "SVG"])
+            .add_filter(
+                "Image files",
+                &[
+                    "png", "PNG", "jpg", "jpeg", "JPG", "JPEG", "bmp", "gif", "tiff", "tif", "webp",
+                ],
+            )
             .add_filter("All files", &["*"])
-            .set_title("Open SVG file")
+            .set_title("Open SVG or image file")
             .pick_file()
     });
 
     match result {
         Ok(path) => path,
         Err(_) => {
-            // rfd panicked (no display, Wayland issue, etc.): fall back to
-            // reading a path from stderr prompt.
-            eprintln!("\nEnter SVG file path: ");
+            eprintln!("\nEnter SVG or image file path: ");
             let mut line = String::new();
             if std::io::stdin().read_line(&mut line).is_ok() {
                 let trimmed = line.trim();
@@ -1494,37 +1623,48 @@ fn native_file_open_svg() -> Option<std::path::PathBuf> {
 // ── Convert ───────────────────────────────────────────────────────────────────
 
 fn do_convert(app: &mut App) {
-    let Some(svg_path) = app.svg_path.clone() else {
-        app.push_error("No SVG loaded. Press 'o' to open one.");
-        app.set_status("No SVG loaded.", Some(80));
+    let Some(source_path) = app.svg_path.clone() else {
+        app.push_error("No file loaded. Press 'o' to open an SVG or image.");
+        app.set_status("No file loaded.", Some(80));
         return;
     };
 
     app.conversion_status = ConversionStatus::Running;
     app.gcode_text = None;
     app.gcode_scroll = 0;
-    app.preview_image = None;
-    app.preview_protocol = None;
-    app.preview_dirty = false;
     app.gcode_preview_image = None;
     app.gcode_preview_protocol = None;
 
-    let settings = app.machine_settings.clone();
-    let layer_overrides = app.layer_override_map();
+    // For image sources the source preview (left panel) is static – keep it.
+    // For SVG, clear it so it can be re-rendered.
+    if !app.is_image_source {
+        app.preview_image = None;
+        app.preview_protocol = None;
+        app.preview_dirty = false;
+    }
 
-    match svg_to_gcode(&svg_path, &settings, layer_overrides) {
+    let settings = app.machine_settings.clone();
+
+    let result = if app.is_image_source {
+        png_to_gcode(&source_path, &settings, app.invert_image)
+    } else {
+        let layer_overrides = app.layer_override_map();
+        svg_to_gcode(&source_path, &settings, layer_overrides)
+    };
+
+    match result {
         Ok(gcode) => {
             let line_count = gcode.lines().count();
             app.push_info(format!("Conversion OK – {} lines of GCode.", line_count));
             app.gcode_text = Some(gcode);
             app.gcode_scroll = 0;
             app.conversion_status = ConversionStatus::Ok;
-            app.preview_dirty = true;
+            if !app.is_image_source {
+                app.preview_dirty = true;
+            }
             app.set_status(format!("Converted: {} GCode lines.", line_count), Some(120));
         }
         Err(e) => {
-            // Check whether the underlying cause is a structured ConversionError
-            // so we can show a rich popup instead of a plain status-bar message.
             if let Some(conv_err) = e.downcast_ref::<ConversionError>() {
                 app.conversion_status = ConversionStatus::Failed(conv_err.title.clone());
                 app.push_error(format!("Conversion failed: {}", conv_err.title));
@@ -1547,7 +1687,7 @@ fn do_save_gcode(app: &mut App) {
     let gcode_clone = match app.gcode_text.clone() {
         Some(g) => g,
         None => {
-            app.push_error("No GCode to save. Convert an SVG first.");
+            app.push_error("No GCode to save. Convert a file first.");
             app.set_status("No GCode to save.", Some(80));
             return;
         }

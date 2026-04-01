@@ -90,8 +90,8 @@ impl MachineSettings {
         "Tolerance (mm)",
         "DPI",
         "Laser power (S)",
-        "Origin X (mm)",
-        "Origin Y (mm)",
+        "Workpiece offset X (mm)",
+        "Workpiece offset Y (mm)",
         "Circular interpolation",
         "Line numbers",
         "Checksums",
@@ -238,8 +238,12 @@ impl MachineSettings {
             8 => "Bezier curve linearisation tolerance in mm.",
             9 => "Dots per inch assumed for SVG pixel/point/pica units.",
             10 => "Laser power S-word appended to the begin sequence.",
-            11 => "X origin offset in mm (shifts the entire job).",
-            12 => "Y origin offset in mm.",
+            11 => {
+                "Workpiece X position in mm. The left edge of the job is placed here. Also editable from the GCode tab with the 'x' key."
+            }
+            12 => {
+                "Workpiece Y position in mm. The bottom edge of the job is placed here. Also editable from the GCode tab with the 'y' key."
+            }
             13 => {
                 "Emit G2/G3 arc commands. Enable only if your firmware supports circular interpolation."
             }
@@ -568,6 +572,27 @@ pub struct App {
     // ── SVG / GCode pipeline ──────────────────────────────────────────────
     /// Path to the loaded SVG file (shown in the UI)
     pub svg_path: Option<PathBuf>,
+    /// True when the loaded source file is a raster image (PNG, JPEG, …)
+    /// rather than an SVG. Controls which converter path is used and
+    /// suppresses the layer panel.
+    pub is_image_source: bool,
+    /// Pixel dimensions (width × height) of the loaded raster image.
+    /// Set when `is_image_source` is true, cleared on new file open.
+    pub image_dimensions: Option<(u32, u32)>,
+    /// When true, the brightness → laser-power mapping is inverted:
+    /// white pixels fire at full power and black pixels fire at zero power.
+    /// Useful for materials that become lighter when lasered (e.g. anodised
+    /// aluminium, dark stone) so a "normal" image produces the correct result.
+    pub invert_image: bool,
+
+    // ── Workpiece offset inline edit ──────────────────────────────────────
+    /// `Some(0)` = editing X offset, `Some(1)` = editing Y offset, `None` = idle.
+    pub offset_edit: Option<u8>,
+    /// Raw text typed into the offset edit buffer.
+    pub offset_edit_buf: String,
+    /// Validation error shown inline during offset edit.
+    pub offset_edit_error: Option<String>,
+
     /// Generated GCode as a plain string (filled after conversion)
     pub gcode_text: Option<String>,
     /// GCode panel vertical scroll offset (line index from top)
@@ -705,6 +730,12 @@ impl App {
             input_draft: String::new(),
 
             svg_path: None,
+            is_image_source: false,
+            image_dimensions: None,
+            invert_image: false,
+            offset_edit: None,
+            offset_edit_buf: String::new(),
+            offset_edit_error: None,
             gcode_text: None,
             gcode_scroll: 0,
             conversion_status: ConversionStatus::Idle,
@@ -1331,6 +1362,51 @@ impl App {
             let toggled = if cur == "true" { "false" } else { "true" };
             let _ = self.machine_settings.set_field(idx, toggled);
         }
+    }
+
+    // ── Workpiece offset inline edit ─────────────────────────────────────
+
+    /// Start inline-editing the workpiece X (axis=0) or Y (axis=1) offset.
+    pub fn begin_offset_edit(&mut self, axis: u8) {
+        let current = if axis == 0 {
+            self.machine_settings.origin_x
+        } else {
+            self.machine_settings.origin_y
+        };
+        self.offset_edit = Some(axis);
+        self.offset_edit_buf = format!("{:.1}", current);
+        self.offset_edit_error = None;
+    }
+
+    /// Commit the offset edit buffer to `machine_settings`.
+    /// On parse error, sets `offset_edit_error` and leaves edit mode active.
+    pub fn commit_offset_edit(&mut self) {
+        let Some(axis) = self.offset_edit else { return };
+        match self.offset_edit_buf.trim().parse::<f64>() {
+            Ok(v) if v >= 0.0 => {
+                if axis == 0 {
+                    self.machine_settings.origin_x = v;
+                } else {
+                    self.machine_settings.origin_y = v;
+                }
+                self.offset_edit = None;
+                self.offset_edit_buf.clear();
+                self.offset_edit_error = None;
+            }
+            Ok(_) => {
+                self.offset_edit_error = Some("Offset must be ≥ 0 mm".into());
+            }
+            Err(e) => {
+                self.offset_edit_error = Some(format!("Not a valid number: {e}"));
+            }
+        }
+    }
+
+    /// Cancel the offset edit without applying changes.
+    pub fn cancel_offset_edit(&mut self) {
+        self.offset_edit = None;
+        self.offset_edit_buf.clear();
+        self.offset_edit_error = None;
     }
 }
 
