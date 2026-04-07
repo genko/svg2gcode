@@ -52,12 +52,12 @@ fn open_port(path: &str, baud: BaudRate) -> Result<Box<dyn SerialPort>> {
         .flow_control(FlowControl::None)
         .timeout(Duration::from_millis(10))
         .open()
-        .with_context(|| format!("Failed to open serial port {path} at {baud}"))
+        .with_context(|| format!("Failed to open serial port {path}"))
 }
 
-// ── Actor messages ────────────────────────────────────────────────────────────
+// ── Serial actor ──────────────────────────────────────────────────────────────
 
-/// Messages the serial actor sends back to the UI.
+/// Events the serial actor sends back to the UI task.
 #[derive(Debug)]
 pub enum SerialEvent {
     /// A complete line (without the trailing newline) received from the device.
@@ -85,6 +85,13 @@ pub enum SerialEvent {
 pub enum SerialCommand {
     /// Send a raw string to the device (a `\n` is appended automatically).
     Send(String),
+    /// Send a single real-time byte to the device **without** appending `\n`.
+    ///
+    /// GRBL real-time commands (e.g. `0x85` = jog cancel, `~` = cycle start,
+    /// `!` = feed hold, `0x18` = soft reset) must be sent as bare bytes so
+    /// that GRBL's interrupt-driven receive handler picks them up immediately,
+    /// regardless of the line buffer state.
+    RealTimeByte(u8),
     /// Stream a list of GCode lines using GRBL's ok-gated simple-sender
     /// protocol: send one line, wait for `ok` or `error:N`, then send the
     /// next.  Progress events are emitted for every acknowledgement.
@@ -96,13 +103,6 @@ pub enum SerialCommand {
     Disconnect,
 }
 
-// ── Serial actor ──────────────────────────────────────────────────────────────
-
-/// Spawn a blocking thread that owns the serial port.
-///
-/// Returns:
-/// - `tx` – send [`SerialCommand`]s to the actor.
-/// - `rx` – receive [`SerialEvent`]s from the actor.
 pub fn spawn_serial_actor(
     path: &str,
     baud: BaudRate,
@@ -125,6 +125,21 @@ pub fn spawn_serial_actor(
 
     Ok((cmd_tx, evt_rx))
 }
+
+// ── Internal writer message ───────────────────────────────────────────────────
+
+/// Message type for the actor → writer thread channel.
+///
+/// Separates line-protocol text (needs `\n` appended) from raw real-time
+/// bytes (must be forwarded verbatim, without a newline).
+enum WriterMsg {
+    /// A normal GCode / command line; `\n` will be appended before sending.
+    Text(String),
+    /// A single real-time byte; sent as-is, no trailing newline.
+    RawByte(u8),
+}
+
+// ── Serial actor loop ─────────────────────────────────────────────────────────
 
 /// Blocking loop that reads from the port and dispatches commands.
 ///
@@ -152,7 +167,7 @@ fn serial_actor_loop(
     let _ = evt_tx.send(SerialEvent::Info(format!("Connected to {path}")));
 
     // Spawn a secondary thread for writes so reads are never blocked by I/O.
-    let (write_tx, write_rx) = std::sync::mpsc::channel::<Option<String>>();
+    let (write_tx, write_rx) = std::sync::mpsc::channel::<Option<WriterMsg>>();
     let evt_tx_writer = evt_tx.clone();
     std::thread::spawn(move || {
         writer_loop(write_port, write_rx, evt_tx_writer);
@@ -176,7 +191,14 @@ fn serial_actor_loop(
                         let _ = evt_tx.send(SerialEvent::Info(
                             "Raw send ignored while streaming – abort stream first.".into(),
                         ));
-                    } else if write_tx.send(Some(text)).is_err() {
+                    } else if write_tx.send(Some(WriterMsg::Text(text))).is_err() {
+                        break;
+                    }
+                }
+                Ok(SerialCommand::RealTimeByte(byte)) => {
+                    // Real-time bytes bypass streaming mode – they must reach
+                    // GRBL immediately (e.g. jog cancel 0x85, feed hold, reset).
+                    if write_tx.send(Some(WriterMsg::RawByte(byte))).is_err() {
                         break;
                     }
                 }
@@ -194,7 +216,7 @@ fn serial_actor_loop(
                         )));
                         // Send the very first line immediately.
                         let first = lines[0].clone();
-                        if write_tx.send(Some(first)).is_err() {
+                        if write_tx.send(Some(WriterMsg::Text(first))).is_err() {
                             break;
                         }
                         stream = Some(StreamState {
@@ -216,13 +238,13 @@ fn serial_actor_loop(
                     }
                 }
                 Ok(SerialCommand::Disconnect) => {
-                    let _ = write_tx.send(None);
+                    let _ = write_tx.send(None); // None = shutdown signal
                     let _ = evt_tx.send(SerialEvent::Disconnected(None));
                     return;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    let _ = write_tx.send(None);
+                    let _ = write_tx.send(None); // None = shutdown signal
                     let _ = evt_tx.send(SerialEvent::Disconnected(None));
                     return;
                 }
@@ -280,7 +302,7 @@ fn serial_actor_loop(
                                 sent: st.sent,
                                 total,
                             });
-                            if write_tx.send(Some(next)).is_err() {
+                            if write_tx.send(Some(WriterMsg::Text(next))).is_err() {
                                 let _ = evt_tx.send(SerialEvent::StreamAborted {
                                     sent: st.sent,
                                     total,
@@ -308,6 +330,66 @@ fn serial_actor_loop(
         }
     }
 }
+
+// ── Writer loop ───────────────────────────────────────────────────────────────
+
+/// Blocking loop that writes messages to the serial port.
+///
+/// Receives `Option<WriterMsg>` from the actor loop via a std channel.
+/// `None` is the shutdown signal.  Text messages have `\n` appended;
+/// raw bytes are forwarded verbatim so that GRBL real-time commands
+/// (e.g. jog cancel `0x85`) arrive as single bytes without a trailing
+/// newline.
+fn writer_loop(
+    mut port: Box<dyn SerialPort>,
+    rx: std::sync::mpsc::Receiver<Option<WriterMsg>>,
+    evt_tx: mpsc::UnboundedSender<SerialEvent>,
+) {
+    for msg in &rx {
+        match msg {
+            None => return, // Shutdown signal
+            Some(WriterMsg::Text(text)) => {
+                let to_send = format!("{text}\n");
+                if let Err(e) = port.write_all(to_send.as_bytes()) {
+                    let _ = evt_tx.send(SerialEvent::Error(format!("Write error: {e}")));
+                    return;
+                }
+                if let Err(e) = port.flush() {
+                    let _ = evt_tx.send(SerialEvent::Error(format!("Flush error: {e}")));
+                    return;
+                }
+            }
+            Some(WriterMsg::RawByte(byte)) => {
+                // Real-time byte: send verbatim, no newline appended.
+                if let Err(e) = port.write_all(&[byte]) {
+                    let _ = evt_tx.send(SerialEvent::Error(format!(
+                        "Write error (real-time byte 0x{byte:02X}): {e}"
+                    )));
+                    return;
+                }
+                if let Err(e) = port.flush() {
+                    let _ = evt_tx.send(SerialEvent::Error(format!("Flush error: {e}")));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// ── Validate helpers (unit-testable) ─────────────────────────────────────────
+
+/// Sanity-check a path before trying to open it.
+pub fn validate_port_path(path: &str) -> Result<()> {
+    if !path.starts_with("/dev/") {
+        bail!("Port path must start with /dev/");
+    }
+    if !std::path::Path::new(path).exists() {
+        bail!("Device {path} does not exist");
+    }
+    Ok(())
+}
+
+// ── ok-gated streaming ────────────────────────────────────────────────────────
 
 /// State kept while streaming GCode line by line.
 pub(crate) struct StreamState {
@@ -374,43 +456,6 @@ pub(crate) fn streaming_step(st: &mut StreamState, line: &str) -> StepOutcome {
         st.next_idx += 1;
         StepOutcome::SendNext(next)
     }
-}
-
-/// Blocking loop that writes lines to the serial port.
-fn writer_loop(
-    mut port: Box<dyn SerialPort>,
-    rx: std::sync::mpsc::Receiver<Option<String>>,
-    evt_tx: mpsc::UnboundedSender<SerialEvent>,
-) {
-    for msg in &rx {
-        match msg {
-            None => return, // Shutdown signal
-            Some(text) => {
-                let to_send = format!("{text}\n");
-                if let Err(e) = port.write_all(to_send.as_bytes()) {
-                    let _ = evt_tx.send(SerialEvent::Error(format!("Write error: {e}")));
-                    return;
-                }
-                if let Err(e) = port.flush() {
-                    let _ = evt_tx.send(SerialEvent::Error(format!("Flush error: {e}")));
-                    return;
-                }
-            }
-        }
-    }
-}
-
-// ── Validate helpers (unit-testable) ─────────────────────────────────────────
-
-/// Sanity-check a path before trying to open it.
-pub fn validate_port_path(path: &str) -> Result<()> {
-    if !path.starts_with("/dev/") {
-        bail!("Port path must start with /dev/");
-    }
-    if !std::path::Path::new(path).exists() {
-        bail!("Device {path} does not exist");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -603,10 +648,10 @@ mod tests {
         );
         assert_eq!(st.sent, 0);
 
-        // Real ok follows
+        // Now the real ok — should advance
         match streaming_step(&mut st, "ok") {
             StepOutcome::SendNext(l) => assert_eq!(l, "G1 X10 S500"),
-            other => panic!("expected SendNext after status, got {other:?}"),
+            other => panic!("expected SendNext, got {other:?}"),
         }
     }
 }

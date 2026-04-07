@@ -70,7 +70,7 @@ use crate::{
         ConversionError, gcode_to_image, laser_bounding_box, png_to_gcode, png_to_preview_image,
         svg_to_gcode,
     },
-    grbl::{GrblLine, JogDir},
+    grbl::{GrblLine, JogDir, MachineState},
     serial::{SerialCommand, SerialEvent, discover_ports, spawn_serial_actor, validate_port_path},
 };
 
@@ -578,6 +578,15 @@ fn handle_control_tab(app: &mut App, key: KeyEvent) -> bool {
 
 fn handle_control_jog(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
+        // ── Jog cancel ──────────────────────────────────────────────────
+        // Esc sends the GRBL real-time jog-cancel byte (0x85) which stops
+        // any in-progress jog motion immediately without altering modal state.
+        KeyCode::Esc => {
+            send_realtime(app, 0x85);
+            app.set_status("Jog cancelled (0x85).", Some(60));
+            true
+        }
+
         // ── XY jogging ──────────────────────────────────────────────────
         KeyCode::Left | KeyCode::Char('h') if key.modifiers == KeyModifiers::NONE => {
             do_jog(app, JogDir::XMinus);
@@ -638,7 +647,11 @@ fn handle_control_jog(app: &mut App, key: KeyEvent) -> bool {
             send_serial_raw(app, "$X");
             true
         }
-        // $H → home
+        // Home key or Shift+H → run homing cycle ($H)
+        KeyCode::Home => {
+            do_home(app);
+            true
+        }
         KeyCode::Char('H') if key.modifiers == KeyModifiers::SHIFT => {
             do_home(app);
             true
@@ -1252,11 +1265,11 @@ fn send_realtime(app: &mut App, byte: u8) {
     if app.mode != AppMode::Connected {
         return;
     }
-    let s = std::str::from_utf8(&[byte])
-        .map(str::to_owned)
-        .unwrap_or_else(|_| format!("\\x{byte:02X}"));
+    // Real-time bytes (feed-hold `!`, cycle-start `~`, soft-reset `0x18`,
+    // jog-cancel `0x85`, …) must be sent as raw bytes – no `\n` appended and
+    // no UTF-8 conversion.  SerialCommand::RealTimeByte handles that path.
     if let Some(tx) = &app.serial_tx {
-        let _ = tx.send(SerialCommand::Send(s));
+        let _ = tx.send(SerialCommand::RealTimeByte(byte));
     }
 }
 
@@ -1308,6 +1321,46 @@ fn do_frame_job(app: &mut App) {
         return;
     }
 
+    // ── Machine-state guard ───────────────────────────────────────────────
+    // Framing sends regular GCode commands (G90, G0 …).  GRBL rejects those
+    // while in Jog or Run state, which can leave the parser in G91 (relative)
+    // mode and cause subsequent rapid moves to travel *relative* to the
+    // jogged-to position – easily driving the head into machine limits.
+    //
+    // • Jog state  → cancel the jog (real-time 0x85) and ask to retry.
+    // • Any other non-Idle state → block with a clear message.
+    // • Status unknown (no poll yet) → allow (machine is likely idle on
+    //   first connect before any motion).
+    if let Some(status) = &app.grbl_status {
+        match &status.state {
+            MachineState::Idle => {} // safe to proceed
+            MachineState::Jog => {
+                // Cancel the jog immediately via the real-time channel so
+                // GRBL processes it before any queued serial data.
+                if let Some(tx) = &app.serial_tx {
+                    let _ = tx.send(SerialCommand::RealTimeByte(0x85));
+                }
+                app.push_info(
+                    "Jog cancelled – wait for the machine to reach Idle, \
+                     then press 'f' again to frame.",
+                );
+                app.set_status("Jog cancelled – retry frame when Idle.", Some(120));
+                return;
+            }
+            state => {
+                let label = state.label();
+                app.push_error(format!(
+                    "Cannot frame while machine is in {label} state – wait for Idle first."
+                ));
+                app.set_status(
+                    format!("Machine not Idle ({label}) – frame blocked."),
+                    Some(120),
+                );
+                return;
+            }
+        }
+    }
+
     let gcode = match &app.gcode_text {
         Some(g) => g.clone(),
         None => {
@@ -1351,12 +1404,8 @@ fn do_frame_job(app: &mut App) {
         } else {
             format!("G0 X{x:.3} Y{y:.3}")
         };
-        if let Some(tx) = &app.serial_tx {
-            if tx.send(SerialCommand::Send(cmd.clone())).is_err() {
-                app.push_error("Serial channel closed during frame job.");
-                return;
-            }
-        }
+        // Use send_serial_raw so every frame move appears in the console log.
+        send_serial_raw(app, &cmd);
     }
 
     app.set_status(

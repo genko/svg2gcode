@@ -1647,7 +1647,7 @@ fn render_ctrl_jog(app: &App, frame: &mut Frame, area: Rect) {
             Style::default().fg(C_INFO),
         )),
         Line::from(Span::styled(
-            "  0x85 (Esc): cancel jog",
+            "  Home/$H: home  Esc: cancel jog",
             Style::default().fg(C_INFO),
         )),
         Line::from(Span::styled(
