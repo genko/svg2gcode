@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["Sameer Puri <crates@purisa.me>"]
 repository = "https://github.com/sameer/svg2gcode"
 license = "MIT"
-description = "Larris – laser + Ferris – a GRBL laser terminal TUI built with Rust"
+description = "Larris – laser + Ferris – a GRBL laser terminal GUI built with Rust and Relm4/GTK4"
 
 [[bin]]
 name = "larris"
@@ -24,22 +24,17 @@ serde = { version = "1", features = ["derive", "std"] }
 serde_repr = "0.1"
 svgtypes = "0.16"
 
-# TUI
-ratatui = "0.30"
-ratatui-image = { version = "10", default-features = false, features = ["image-defaults", "crossterm"] }
-crossterm = "0.29"
+# GTK4 GUI — Relm4 brings gtk4, glib, gdk4, and tokio as transitive deps
+relm4 = { version = "0.9", features = ["macros"] }
 
 # Serial port
 serialport = "4"
 
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-
 # GCode parsing (gcode → SVG preview path reconstruction)
 gcode-nom = "0.6"
 
-# Image handling for the SVG preview rendered into ratatui-image
-image = { version = "0.25", default-features = false, features = ["png"] }
+# Image handling for preview panels (RGBA pixel buffer → GDK texture)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # SVG rendering to a pixel buffer (used for the preview panel)
 resvg = "0.44"
@@ -48,9 +43,6 @@ usvg = "0.44"
 
 # XML / SVG document parsing (shared with svg2gcode lib)
 roxmltree = "0.21"
-
-# Native file picker dialog (SVG open / GCode save)
-rfd = "0.15"
 
 # Utilities
 anyhow = "1"

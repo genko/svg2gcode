@@ -1,10 +1,12 @@
+#![allow(dead_code)]
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use crate::svg2gcode::{LayerMode, LayerOverrideOptions, SvgLayerInfo};
 use image::RgbaImage;
 
-use crate::serial::SerialCommand;
+use crate::serial::{SerialCommand, SerialEvent};
 
 // ── Machine / conversion settings ────────────────────────────────────────────
 
@@ -493,7 +495,7 @@ pub struct App {
 
     // ── Serial port selection ─────────────────────────────────────────────
     pub port_list: Vec<String>,
-    pub port_list_state: ratatui::widgets::ListState,
+    pub port_list_selected: Option<usize>,
 
     // ── Baud-rate combo-box ───────────────────────────────────────────────
     pub baud_rates: Vec<BaudRate>,
@@ -503,7 +505,8 @@ pub struct App {
     // ── Connection ────────────────────────────────────────────────────────
     pub mode: AppMode,
     pub connected_port: Option<String>,
-    pub serial_tx: Option<tokio::sync::mpsc::UnboundedSender<SerialCommand>>,
+    pub serial_tx: Option<std::sync::mpsc::Sender<SerialCommand>>,
+    pub serial_rx: Option<std::sync::mpsc::Receiver<SerialEvent>>,
 
     // ── Console log ───────────────────────────────────────────────────────
     pub console_lines: VecDeque<ConsoleLine>,
@@ -562,17 +565,11 @@ pub struct App {
     pub layer_edit_error: Option<String>,
 
     // ── Preview image ─────────────────────────────────────────────────────
-    /// RGBA pixel image built by rendering the source SVG (for ratatui-image)
+    /// RGBA pixel image built by rendering the source SVG (set by do_convert / do_open_svg)
     pub preview_image: Option<RgbaImage>,
-    /// Protocol state for ratatui-image for the SVG preview panel
-    pub preview_protocol: Option<ratatui_image::protocol::StatefulProtocol>,
-    /// Whether the SVG preview needs to be re-encoded (size changed, new image, …)
-    pub preview_dirty: bool,
 
-    /// RGBA pixel image built by tracing the GCode toolpath (for ratatui-image)
+    /// RGBA pixel image built by tracing the GCode toolpath (set by do_render_preview)
     pub gcode_preview_image: Option<RgbaImage>,
-    /// Protocol state for ratatui-image for the GCode toolpath preview panel
-    pub gcode_preview_protocol: Option<ratatui_image::protocol::StatefulProtocol>,
 
     /// When true, G0 rapid/travel moves are drawn in the GCode toolpath preview
     pub show_travel_lines: bool,
@@ -614,7 +611,7 @@ pub struct App {
     /// Received `$N=value` lines (key, value)
     pub grbl_settings: Vec<(String, String)>,
     /// Cursor inside the settings list
-    pub settings_list_state: ratatui::widgets::ListState,
+    pub settings_list_selected: Option<usize>,
     /// G-code parser state string from `[GC:…]`
     pub gc_state: Option<String>,
 
@@ -623,9 +620,6 @@ pub struct App {
 
     // ── Misc ──────────────────────────────────────────────────────────────
     pub should_quit: bool,
-    /// Set to true after a native dialog so the main loop forces a full
-    /// terminal redraw (clears ratatui's internal diff buffer).
-    pub needs_clear: bool,
     /// When Some(_), a modal error popup is shown with this content.
     /// Dismissed by the user pressing Esc or Enter.
     pub conversion_error_popup: Option<ConversionErrorPopup>,
@@ -644,12 +638,6 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        let mut list_state = ratatui::widgets::ListState::default();
-        list_state.select(Some(0));
-
-        let mut settings_list_state = ratatui::widgets::ListState::default();
-        settings_list_state.select(Some(0));
-
         Self {
             active_tab: ActiveTab::Connect,
             focused: FocusedPane::SerialList,
@@ -657,7 +645,7 @@ impl App {
             gcode_focus: GCodeFocus::GCode,
 
             port_list: Vec::new(),
-            port_list_state: list_state,
+            port_list_selected: Some(0),
 
             baud_rates: BaudRate::ALL.to_vec(),
             selected_baud_idx: 0,
@@ -666,6 +654,7 @@ impl App {
             mode: AppMode::Disconnected,
             connected_port: None,
             serial_tx: None,
+            serial_rx: None,
 
             console_lines: VecDeque::new(),
             console_scroll: 0,
@@ -695,11 +684,8 @@ impl App {
             layer_edit_error: None,
 
             preview_image: None,
-            preview_protocol: None,
-            preview_dirty: false,
 
             gcode_preview_image: None,
-            gcode_preview_protocol: None,
             show_travel_lines: false,
 
             machine_settings: MachineSettings::default(),
@@ -719,13 +705,12 @@ impl App {
             override_spindle: 100,
 
             grbl_settings: Vec::new(),
-            settings_list_state,
+            settings_list_selected: Some(0),
             gc_state: None,
 
             last_probe: None,
 
             should_quit: false,
-            needs_clear: false,
             conversion_error_popup: None,
             is_streaming: false,
             stream_sent: 0,
@@ -788,8 +773,7 @@ impl App {
     // ── Port list helpers ─────────────────────────────────────────────────
 
     pub fn selected_port(&self) -> Option<&str> {
-        self.port_list_state
-            .selected()
+        self.port_list_selected
             .and_then(|i| self.port_list.get(i))
             .map(String::as_str)
     }
@@ -802,22 +786,22 @@ impl App {
         if self.port_list.is_empty() {
             return;
         }
-        let i = match self.port_list_state.selected() {
+        let i = match self.port_list_selected {
             Some(i) => (i + 1) % self.port_list.len(),
             None => 0,
         };
-        self.port_list_state.select(Some(i));
+        self.port_list_selected = Some(i);
     }
 
     pub fn port_list_prev(&mut self) {
         if self.port_list.is_empty() {
             return;
         }
-        let i = match self.port_list_state.selected() {
+        let i = match self.port_list_selected {
             Some(0) | None => self.port_list.len().saturating_sub(1),
             Some(i) => i - 1,
         };
-        self.port_list_state.select(Some(i));
+        self.port_list_selected = Some(i);
     }
 
     // ── Baud combo helpers ────────────────────────────────────────────────
@@ -1222,8 +1206,8 @@ impl App {
         if len == 0 {
             return;
         }
-        let i = self.settings_list_state.selected().unwrap_or(0);
-        self.settings_list_state.select(Some((i + 1) % len));
+        let i = self.settings_list_selected.unwrap_or(0);
+        self.settings_list_selected = Some((i + 1) % len);
     }
 
     pub fn settings_prev(&mut self) {
@@ -1231,9 +1215,8 @@ impl App {
         if len == 0 {
             return;
         }
-        let i = self.settings_list_state.selected().unwrap_or(0);
-        self.settings_list_state
-            .select(Some(if i == 0 { len - 1 } else { i - 1 }));
+        let i = self.settings_list_selected.unwrap_or(0);
+        self.settings_list_selected = Some(if i == 0 { len - 1 } else { i - 1 });
     }
 
     // ── Conversion error popup ────────────────────────────────────────────

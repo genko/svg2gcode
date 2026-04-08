@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serialport::{DataBits, FlowControl, Parity, SerialPort, StopBits};
-use tokio::sync::mpsc;
+use std::sync::mpsc;
 
 use crate::app::BaudRate;
 
@@ -106,14 +106,11 @@ pub enum SerialCommand {
 pub fn spawn_serial_actor(
     path: &str,
     baud: BaudRate,
-) -> Result<(
-    mpsc::UnboundedSender<SerialCommand>,
-    mpsc::UnboundedReceiver<SerialEvent>,
-)> {
+) -> Result<(mpsc::Sender<SerialCommand>, mpsc::Receiver<SerialEvent>)> {
     let port = open_port(path, baud)?;
 
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SerialCommand>();
-    let (evt_tx, evt_rx) = mpsc::unbounded_channel::<SerialEvent>();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<SerialCommand>();
+    let (evt_tx, evt_rx) = mpsc::channel::<SerialEvent>();
 
     let path_owned = path.to_owned();
 
@@ -147,8 +144,8 @@ enum WriterMsg {
 fn serial_actor_loop(
     port: Box<dyn SerialPort>,
     path: String,
-    mut cmd_rx: mpsc::UnboundedReceiver<SerialCommand>,
-    evt_tx: mpsc::UnboundedSender<SerialEvent>,
+    cmd_rx: mpsc::Receiver<SerialCommand>,
+    evt_tx: mpsc::Sender<SerialEvent>,
 ) {
     // We need two handles to the port: one for reading, one for writing.
     let write_port = match port.try_clone() {
@@ -167,7 +164,7 @@ fn serial_actor_loop(
     let _ = evt_tx.send(SerialEvent::Info(format!("Connected to {path}")));
 
     // Spawn a secondary thread for writes so reads are never blocked by I/O.
-    let (write_tx, write_rx) = std::sync::mpsc::channel::<Option<WriterMsg>>();
+    let (write_tx, write_rx) = mpsc::channel::<Option<WriterMsg>>();
     let evt_tx_writer = evt_tx.clone();
     std::thread::spawn(move || {
         writer_loop(write_port, write_rx, evt_tx_writer);
@@ -242,8 +239,8 @@ fn serial_actor_loop(
                     let _ = evt_tx.send(SerialEvent::Disconnected(None));
                     return;
                 }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
                     let _ = write_tx.send(None); // None = shutdown signal
                     let _ = evt_tx.send(SerialEvent::Disconnected(None));
                     return;
@@ -342,8 +339,8 @@ fn serial_actor_loop(
 /// newline.
 fn writer_loop(
     mut port: Box<dyn SerialPort>,
-    rx: std::sync::mpsc::Receiver<Option<WriterMsg>>,
-    evt_tx: mpsc::UnboundedSender<SerialEvent>,
+    rx: mpsc::Receiver<Option<WriterMsg>>,
+    evt_tx: mpsc::Sender<SerialEvent>,
 ) {
     for msg in &rx {
         match msg {
