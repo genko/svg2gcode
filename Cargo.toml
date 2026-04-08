@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["Sameer Puri <crates@purisa.me>"]
 repository = "https://github.com/sameer/svg2gcode"
 license = "MIT"
-description = "Larris – laser + Ferris – a GRBL laser terminal GUI built with Rust and Relm4/GTK4"
+description = "Larris – laser + Ferris – a GRBL laser GUI built with Rust and Relm4/GTK4"
 
 [[bin]]
 name = "larris"

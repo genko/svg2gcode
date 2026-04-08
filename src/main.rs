@@ -1,4 +1,4 @@
-//! Larris – GRBL laser terminal – Relm4/GTK4 GUI entry point.
+//! Larris – GRBL laser  – Relm4/GTK4 GUI entry point.
 //!
 //! Architecture:
 //!  - Relm4 0.9 Component drives the GTK4 main loop.
@@ -505,7 +505,7 @@ impl Component for AppComponent {
 
     fn init_root() -> gtk::Window {
         gtk::Window::builder()
-            .title("Larris – GRBL Laser Terminal")
+            .title("Larris – GRBL Laser GUI")
             .default_width(1200)
             .default_height(800)
             .build()
@@ -522,7 +522,8 @@ impl Component for AppComponent {
             app.push_info(format!("Found {} serial port(s).", app.port_list.len()));
             app.port_list_selected = Some(0);
         }
-        app.push_info("Welcome to Larris – GRBL Laser Terminal.");
+        app.push_info("Welcome to Larris – GRBL Laser GUI.");
+        app.push_info("Select a serial port and click connect to begin.");
 
         let model = AppComponent {
             app,
